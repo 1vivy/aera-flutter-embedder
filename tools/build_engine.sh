@@ -37,7 +37,13 @@ export PATH=$work/depot_tools:$PATH
 # The engine lives in the flutter/flutter monorepo; the release tag pins the
 # framework and engine together, so the Dart VM in the engine matches the
 # frontend_server shipped with that Flutter SDK.
-[ -d flutter ] || git clone --depth 1 --branch "$version" https://github.com/flutter/flutter.git
+if [ -d flutter ]; then
+    # A kept work dir may hold another release; switch it to this one.
+    git -C flutter fetch --depth 1 origin "refs/tags/$version:refs/tags/$version"
+    git -C flutter checkout -q --force --detach "refs/tags/$version"
+else
+    git clone --depth 1 --branch "$version" https://github.com/flutter/flutter.git
+fi
 cd flutter
 # Same revision string the kits and `flutter --version` report.
 rev=$(cat bin/internal/engine.version 2>/dev/null || git rev-parse HEAD)
