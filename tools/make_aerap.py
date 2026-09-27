@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Pack a staged AERA Flutter payload into an installable .aerap.
 
-The package uses the `browser` ID with the `browser-runtime` type, which is
-the only AERA host that gives a plugin the GPU. AERA installs it as an
-unofficial app after a warning; it replaces AERA Browser on that device until
-the official browser is reinstalled.
+The package targets AERA's generic pixel + GPU plugin host, which an AERA
+maintainer is adding and which is not released yet. The manifest fields that
+depend on it are the ASSUMED constants below; everything else (ID rules,
+limits, the payload format) is what AERA's plugin manager already enforces
+for Host API 2 plugins. The app keeps its own ID, so it installs next to AERA
+Browser instead of replacing it.
 
-    tools/make_aerap.py --stage build/stage --name "My App" --version 0.1.0 \\
-        --description "What it does" --out build/My-App-0.1.0.aerap
+    tools/make_aerap.py --stage build/stage --id org.example.app --name "My App" \\
+        --version 0.1.0 --description "What it does" --out build/My-App-0.1.0.aerap
+
+Add --privileged to ask for the opt-in privileged mode (see PRIVILEGED).
 
 The payload format (AERAWEB1 + xz with the ARM64 filter) and limits follow
-aeraui/features/browser/runtime.cpp in AERA-Recovery/android_bootable_recovery.
+aeraui/features/browser/runtime.cpp, and the manifest checks follow
+aeraui/features/plugins/plugin_manager.cpp, in
+AERA-Recovery/android_bootable_recovery (branch aera-16.0).
 """
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import struct
 import subprocess
@@ -22,6 +29,22 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+
+# Host API 2's generic manifest (plugin_manager.cpp), which the pixel host is
+# assumed to extend.
+TYPE = "ui-runtime"
+ENTRY = "main"
+EXECUTABLE = "usr/bin/aera-plugin"
+# ASSUMED: the pixel host is Host API 3 with protocol version 3.
+HOST_API = 3
+PROTOCOL_VERSION = 3
+# `display` and `touch-input` are required by Host API 2. The rest are ASSUMED
+# names for what the pixel host will grant.
+PERMISSIONS = ["display", "touch-input", "pixel-surface", "gpu-acceleration",
+               "audio-output", "network"]
+# ASSUMED: opting in to the privileged mode (root, recovery's filesystem and
+# devices, like Host API 2 plugins today) is one more permission.
+PRIVILEGED = "privileged"
 
 MAX_MEMBERS = 4096
 MAX_MEMBER_BYTES = 100 * 1024 * 1024
@@ -116,16 +139,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--stage", type=Path, required=True)
+    parser.add_argument("--id", required=True,
+                        help="plugin ID: lowercase letters, digits, '-' and '.', up to 64")
     parser.add_argument("--name", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--description", default="A Flutter app for AERA Recovery.")
     parser.add_argument("--payload-url", default="https://example.invalid/runtime.xz",
                         help="where runtime.xz is published; unused for local installs")
+    parser.add_argument("--privileged", action="store_true",
+                        help="ask for the opt-in privileged mode")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
-    if not (args.stage / "usr/bin/aera-browser-worker").is_file():
-        sys.exit("stage has no usr/bin/aera-browser-worker")
+    for program in (EXECUTABLE, "usr/bin/aera-flutter"):
+        if not (args.stage / program).is_file():
+            sys.exit(f"stage has no {program}")
+    if (not re.fullmatch(r"[a-z0-9.-]{1,64}", args.id) or args.id[0] == "." or args.id[-1] == "."
+            or args.id == "browser"):
+        sys.exit(f"plugin ID {args.id!r} is not allowed")
     if not (args.stage / "usr/share/flutter/flutter_assets").is_dir():
         sys.exit("stage has no usr/share/flutter/flutter_assets")
     if len(args.name) > 80 or len(args.description) > 320 or len(args.version) > 32:
@@ -140,18 +171,19 @@ def main():
             sys.exit("payload exceeds AERA's 512 MiB limit")
         manifest = {
             "schema": 1,
-            "id": "browser",
+            "id": args.id,
             "name": args.name,
             "version": args.version,
             "description": args.description,
-            "type": "browser-runtime",
-            "entry": "browser",
-            "min_host_api": 1,
+            "type": TYPE,
+            "entry": ENTRY,
+            "min_host_api": HOST_API,
+            "protocol_version": PROTOCOL_VERSION,
+            "executable": EXECUTABLE,
             "payload": "runtime.xz",
             "payload_url": args.payload_url,
             **sizes,
-            "permissions": ["network", "display", "temporary-memory", "audio-output",
-                            "gpu-acceleration", "download-storage"],
+            "permissions": PERMISSIONS + ([PRIVILEGED] if args.privileged else []),
         }
         manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
         temporary = args.out.with_suffix(args.out.suffix + ".new")

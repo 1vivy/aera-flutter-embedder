@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """Assemble the AERA Flutter runtime: everything a Flutter app needs inside
-AERA's browser jail except the app itself.
+AERA's generic pixel + GPU plugin host except the app itself.
 
-The jail chroots into the extracted payload, so the payload must be a complete
-userspace: the glibc loader and libraries, the Flutter engine, Mesa (EGL,
-GLES, Zink, Turnip KGSL), the Vulkan loader, fonts, and the embedder at
-/usr/bin/aera-browser-worker. Shared libraries are copied as real files under
+The payload is a complete userspace, so it works whether or not AERA chroots
+into it: the glibc loader and libraries, the Flutter engine, Mesa (EGL, GLES,
+Zink, Turnip KGSL), the Vulkan loader, fonts, the static launcher at
+/usr/bin/aera-plugin (what AERA starts) and the embedder at
+/usr/bin/aera-flutter. Shared libraries are copied as real files under
 their sonames (the AERA payload format carries no symlinks), and every
 DT_NEEDED entry is resolved from the given sysroots so nothing is missing at
 run time.
 
     tools/assemble_runtime.py --out build/runtime \\
-        --worker target/aarch64-unknown-linux-gnu/release/aera-browser-worker \\
+        --launcher target/aarch64-unknown-linux-gnu/release/aera-plugin \\
+        --embedder target/aarch64-unknown-linux-gnu/release/aera-flutter \\
         --engine engine/linux-arm64/libflutter_engine.so \\
         --icu engine/icudtl.dat --mesa mesa/stage \\
         --sysroot /usr/lib/aarch64-linux-gnu --sysroot /lib/aarch64-linux-gnu \\
         --fonts /usr/share/fonts/truetype/roboto/unhinted/RobotoTTF
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -50,7 +53,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--worker", type=Path, required=True)
+    parser.add_argument("--launcher", type=Path, required=True,
+                        help="static aera-plugin (built with +crt-static)")
+    parser.add_argument("--embedder", type=Path, required=True)
     parser.add_argument("--engine", type=Path, required=True)
     parser.add_argument("--icu", type=Path, required=True)
     parser.add_argument("--mesa", type=Path, required=True,
@@ -70,8 +75,9 @@ def main():
                       out / "usr/share/fonts", out / "usr/share/vulkan/icd.d"):
         directory.mkdir(parents=True, exist_ok=True)
 
-    shutil.copy2(args.worker, out / "usr/bin/aera-browser-worker")
-    os.chmod(out / "usr/bin/aera-browser-worker", 0o755)
+    for source, name in ((args.launcher, "aera-plugin"), (args.embedder, "aera-flutter")):
+        shutil.copy2(source, out / "usr/bin" / name)
+        os.chmod(out / "usr/bin" / name, 0o755)
     shutil.copy2(args.engine, usr_lib / "libflutter_engine.so")
     shutil.copy2(args.icu, out / "usr/share/flutter/icudtl.dat")
 
@@ -82,9 +88,13 @@ def main():
     for entry in (mesa_lib).iterdir():
         if entry.name.startswith("libgallium-") and entry.suffix == ".so":
             shutil.copy2(entry, usr_lib / entry.name)
-    # AERA's jail points VK_DRIVER_FILES at exactly this path.
+    # aera-plugin points VK_DRIVER_FILES here. The driver path is made
+    # relative to the JSON file so it resolves wherever AERA extracts the
+    # payload, chroot or not.
     icds = list((args.mesa / "usr/share/vulkan/icd.d").glob("freedreno_icd*.json"))
-    shutil.copy2(icds[0], out / "usr/share/vulkan/icd.d/freedreno_icd.json")
+    icd = json.loads(icds[0].read_text())
+    icd["ICD"]["library_path"] = "../../../lib/libvulkan_freedreno.so"
+    (out / "usr/share/vulkan/icd.d/freedreno_icd.json").write_text(json.dumps(icd, indent=4) + "\n")
     if (args.mesa / "usr/share/drirc.d").is_dir():
         shutil.copytree(args.mesa / "usr/share/drirc.d", out / "usr/share/drirc.d")
 
@@ -95,8 +105,10 @@ def main():
                 sys.exit(f"missing {name}")
             shutil.copy2(source, usr_lib / name)
 
-    # Resolve the DT_NEEDED closure of every ELF in the tree.
-    pending = [p for p in out.rglob("*") if p.is_file() and p.read_bytes()[:4] == b"\x7fELF"]
+    # Resolve the DT_NEEDED closure of every ELF in the tree. The static
+    # launcher needs nothing.
+    pending = [p for p in out.rglob("*") if p.is_file() and p.read_bytes()[:4] == b"\x7fELF"
+               and p.name != "aera-plugin"]
     seen = set()
     while pending:
         path = pending.pop()

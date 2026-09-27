@@ -1,6 +1,7 @@
-# Builds the runtime and simulator kits and publishes them as the
-# `flutter-<version>` release that aera-flutter-template downloads from.
-# Run it from the Actions tab (Run workflow).
+# Builds the runtime and simulator kits for AERA's generic pixel + GPU host
+# and publishes them as the `generic-host-flutter-<version>` release that the
+# template's generic-host branch downloads from. Run it from the Actions tab
+# with this branch selected.
 name: Kits
 on:
   workflow_dispatch:
@@ -37,7 +38,12 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - run: tools/build_mesa.sh "$RUNNER_TEMP/mesa"
-      - run: cargo build --release --no-default-features --bin aera-browser-worker
+      - run: cargo build --release --no-default-features --bin aera-flutter
+      - run: cargo build --release -p aera-plugin --target aarch64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          # Native build on the arm64 runner, not the cross linker in .cargo/config.toml.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: gcc
       - run: |
           base=https://storage.googleapis.com/flutter_infra_release/flutter/$ENGINE
           curl -fsSL -o engine.zip $base/linux-arm64/linux-arm64-embedder.zip
@@ -46,7 +52,8 @@ jobs:
           unzip -o artifacts.zip icudtl.dat -d engine
       - run: |
           python3 tools/assemble_runtime.py --out runtime \
-            --worker target/release/aera-browser-worker \
+            --launcher target/aarch64-unknown-linux-gnu/release/aera-plugin \
+            --embedder target/release/aera-flutter \
             --engine engine/libflutter_engine.so --icu engine/icudtl.dat \
             --mesa "$RUNNER_TEMP/mesa" --readelf readelf \
             --sysroot /usr/lib/aarch64-linux-gnu --sysroot /lib/aarch64-linux-gnu \
@@ -68,13 +75,16 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev unzip
       - run: cargo build --release
+      - run: cargo build --release -p aera-plugin --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
       - run: |
           base=https://storage.googleapis.com/flutter_infra_release/flutter/$ENGINE
           curl -fsSL -o engine.zip $base/linux-x64/linux-x64-embedder.zip
           curl -fsSL -o artifacts.zip $base/linux-x64/artifacts.zip
           kit=simkit
           mkdir -p $kit/bin $kit/usr/lib $kit/usr/share/flutter
-          cp target/release/aera-browser-worker target/release/aera-host-sim $kit/bin/
+          cp target/x86_64-unknown-linux-gnu/release/aera-plugin target/release/aera-flutter target/release/aera-host-sim $kit/bin/
           unzip -p engine.zip libflutter_engine.so > $kit/usr/lib/libflutter_engine.so
           unzip -p artifacts.zip icudtl.dat > $kit/usr/share/flutter/icudtl.dat
           echo "$FLUTTER_VERSION" > $kit/flutter-version
@@ -94,11 +104,12 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: flutter-${{ inputs.flutter_version }}
+          tag_name: generic-host-flutter-${{ inputs.flutter_version }}
           target_commitish: ${{ github.sha }}
-          name: Kits for Flutter ${{ inputs.flutter_version }}
+          name: Generic host kits for Flutter ${{ inputs.flutter_version }}
           body: |
-            Kits used by aera-flutter-template for Flutter ${{ inputs.flutter_version }} (engine ${{ needs.engine.outputs.revision }}).
-            - `aera-flutter-runtime-arm64`: everything an app needs inside AERA's browser jail (glibc, Flutter engine, Mesa 26.2.2 with Zink + Turnip KGSL, Roboto, the embedder).
-            - `aera-flutter-simkit-x64`: the embedder, `aera-host-sim` and the x64 engine for running apps on a PC.
+            Kits for AERA's generic pixel + GPU host (assumed interface, see src/host.rs), used by aera-flutter-template's generic-host branch, for Flutter ${{ inputs.flutter_version }} (engine ${{ needs.engine.outputs.revision }}).
+            - `aera-flutter-runtime-arm64`: everything an app needs on AERA's generic pixel + GPU host (glibc, Flutter engine, Mesa 26.2.2 with Zink + Turnip KGSL, Roboto, `aera-plugin` and `aera-flutter`).
+            - `aera-flutter-simkit-x64`: `aera-plugin`, `aera-flutter`, `aera-host-sim` and the x64 engine for running apps on a PC.
+          prerelease: true
           files: '*.tar.xz'

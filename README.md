@@ -1,47 +1,79 @@
-# aera-flutter-embedder
+# aera-flutter-embedder (generic-host branch)
 
-Runs Flutter apps **inside AERA Recovery**, drawn by the phone's GPU.
+Runs Flutter apps **inside AERA Recovery**, drawn by the phone's GPU, on the
+generic pixel + GPU plugin host an AERA maintainer is adding.
 
-AERA gives the GPU only to its browser slot, so this embedder speaks AERA
-Browser's worker protocol: AERA starts it as `/usr/bin/aera-browser-worker
---isolated-ipc-v1` inside the browser jail, with a shared frame buffer on fd 3
-(two 1080x2100 BGRA slots) and a `SOCK_SEQPACKET` control socket on fd 4
-(`aeraui/features/browser/protocol.hpp` in AERA-Recovery/android_bootable_recovery).
-The embedder renders with Flutter's OpenGL backend on surfaceless EGL, which
-Mesa's Zink turns into Vulkan on Turnip over `/dev/kgsl-3d0`, then copies each
-frame into AERA's buffer. Touches, keys, Back and Close arrive on the socket.
+> **The host is not released yet.** This branch is written against an
+> assumed interface so it is ready to switch the day the official one lands.
+> Every guess lives in [`src/host.rs`](src/host.rs) and in the manifest
+> constants at the top of [`tools/make_aerap.py`](tools/make_aerap.py), each
+> marked `ASSUMED`. What we need from the host is tracked in
+> [aera-flutter-demo#1](https://github.com/1vivy/aera-flutter-demo/issues/1).
+> The `main` branch keeps the working stopgap that borrows AERA Browser's slot.
 
-App developers don't need this repo directly: start from
-[aera-flutter-template](https://github.com/1vivy/aera-flutter-template), which
-downloads the kits built here.
+## How it runs
+
+The app is an ordinary Host API 2 style plugin with its own ID
+(`type: "ui-runtime"`, `entry: "main"`, `executable: "usr/bin/aera-plugin"`),
+so it installs next to AERA Browser instead of replacing it, and AERA draws no
+browser chrome over it.
+
+1. AERA extracts the payload and starts `usr/bin/aera-plugin
+   --aera-host-api=3` with its control channel on fd 4 and, assumed, a pixel
+   surface memfd on fd 3.
+2. `aera-plugin` is a small static program. It finds the runtime around
+   itself, points Mesa and the Vulkan loader into it, and execs
+   `usr/bin/aera-flutter` through the runtime's own glibc loader, so the app
+   works whether or not AERA chroots into the payload.
+3. `aera-flutter` handshakes (`HELLO` → `HELLO_ACK` with the pixel surface
+   feature → `SURFACE` with width, height, stride, slots and scale), renders
+   with Flutter's OpenGL backend on surfaceless EGL (Mesa Zink → Turnip →
+   `/dev/kgsl-3d0`), copies each frame into a free slot and sends `PRESENT`.
+   AERA answers `FRAME_DONE`. Touches, keys, Back and lifecycle arrive on the
+   channel.
+
+Host API 2 plugins run as root with recovery's full access. The template asks
+for that only through an opt-in `privileged` flag, assuming the pixel host
+will offer a jailed default and a privileged mode.
 
 ## Pieces
 
 | Path | What |
 | --- | --- |
-| `src/main.rs` | `aera-browser-worker`, the embedder |
-| `src/bin/host_sim.rs` | `aera-host-sim`, AERA's side of the protocol on a PC; writes frames as PNGs and replays taps and keys |
-| `tools/assemble_runtime.py` | builds the arm64 runtime: glibc, Flutter engine, Mesa, fonts and the embedder, as real files resolved by soname |
-| `tools/make_aerap.py` | packs a staged payload into an installable `.aerap` (`browser` ID, `browser-runtime` type) |
-| `tools/package_kits.sh` | makes the runtime and simulator kits published as releases (`flutter-<version>` tags) |
+| `src/host.rs` | the assumed host interface: messages, handshake, surface |
+| `src/bin/aera_flutter.rs` | `aera-flutter`, the embedder |
+| `launcher/` | `aera-plugin`, the static launcher AERA starts |
+| `src/bin/host_sim.rs` | `aera-host-sim`, the assumed host on a PC; writes frames as PNGs and replays taps, keys, Back and lifecycle |
+| `tools/assemble_runtime.py` | builds the arm64 runtime: glibc, Flutter engine, Mesa, fonts, launcher and embedder, as real files resolved by soname |
+| `tools/make_aerap.py` | packs a staged payload into an installable `.aerap` under the app's own ID |
+| `tools/package_kits.sh` | makes the runtime and simulator kits, published as `generic-host-flutter-<version>` releases |
 
 ## Build
 
 ```sh
-cargo build --release                                   # PC: worker + simulator
+cargo build --release                                   # PC: embedder + simulator
+RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release -p aera-plugin --target x86_64-unknown-linux-gnu
 cargo build --release --target aarch64-unknown-linux-gnu \
-    --no-default-features --bin aera-browser-worker     # phone
+    --no-default-features --bin aera-flutter            # phone
+RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release -p aera-plugin --target aarch64-unknown-linux-gnu
 ```
 
 Mesa 26.2.2 is built for arm64 with `-Dgallium-drivers=zink,softpipe
 -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm,kgsl -Dplatforms=` and AERA
 Browser's `mesa-26.2.2-zink-kgsl-surfaceless.patch`.
 
+## Switching to the official host
+
+1. Replace the `ASSUMED` constants and kinds in `src/host.rs` with the real
+   ones, and adjust `connect()` if the handshake differs.
+2. Replace the `ASSUMED` manifest constants in `tools/make_aerap.py`.
+3. Run `cargo test` and the simulator, then the Kits workflow on this branch.
+
 ## Limits
 
 - The engine is Google's debug (JIT) embedder build, so apps are debug builds
-  and must use exactly the Flutter release named in the kit. Release (AOT)
-  needs a custom engine build.
-- Installing replaces AERA Browser on that phone until the browser is
-  reinstalled, and AERA's browser top bar stays above the app.
-- The jail denies `listen()`, so the Dart VM service is off.
+  and must use exactly the Flutter release named in the kit.
+- The Flutter engine only looks for fonts in `/usr/share/fonts`, so unless the
+  host chroots into the payload, apps need to bundle their fonts as assets.

@@ -1,5 +1,5 @@
 //! Flutter engine glue: loads `libflutter_engine.so`, renders with the GPU
-//! into AERA's shared frames, and turns bridge packets into Flutter input.
+//! into AERA's pixel surface, and turns host messages into Flutter input.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::bridge::{self, kind, Control, Frames, Packet};
+use crate::host::{self, kind, lifecycle, Control, Geometry, Message, Surface};
 use crate::ffi::*;
 use crate::gl::Gpu;
 use crate::text_input::{Effect, TextInput};
@@ -28,7 +28,7 @@ pub struct Config {
 }
 
 struct FrameState {
-    /// Last sequence sent to AERA.
+    /// Last sequence presented to AERA.
     sequence: u32,
     /// A frame is out and AERA has not acknowledged it yet.
     pending: bool,
@@ -46,7 +46,7 @@ struct Shared {
     procs: FlutterEngineProcTable,
     engine: AtomicPtr<_FlutterEngine>,
     gpu: Gpu,
-    frames: Frames,
+    surface: Surface,
     control: Control,
     frame_state: Mutex<FrameState>,
     frame_acked: Condvar,
@@ -65,7 +65,9 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    pub fn start(config: Config, frames: Frames, control: Control) -> Result<Embedder, String> {
+    pub fn start(config: Config, session: host::Session) -> Result<Embedder, String> {
+        let host::Session { control, surface, early, .. } = session;
+        let geometry = surface.geometry();
         let library = unsafe { libloading::Library::new(&config.engine_library) }
             .map_err(|e| format!("load {}: {e}", config.engine_library.display()))?;
         let mut procs: FlutterEngineProcTable = unsafe { std::mem::zeroed() };
@@ -77,7 +79,7 @@ impl Embedder {
                 return Err("FlutterEngineGetProcAddresses failed".into());
             }
         }
-        let gpu = Gpu::new(bridge::WIDTH, bridge::HEIGHT)?;
+        let gpu = Gpu::new(geometry.width as i32, geometry.height as i32)?;
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake < 0 {
             return Err("eventfd failed".into());
@@ -86,11 +88,11 @@ impl Embedder {
             procs,
             engine: AtomicPtr::new(std::ptr::null_mut()),
             gpu,
-            frames,
+            surface,
             control,
             frame_state: Mutex::new(FrameState { sequence: 0, pending: false }),
             frame_acked: Condvar::new(),
-            scratch: Mutex::new(vec![0; bridge::FRAME_BYTES]),
+            scratch: Mutex::new(vec![0; geometry.width as usize * geometry.height as usize * 4]),
             closed: AtomicBool::new(false),
             platform_thread: std::thread::current().id(),
             tasks: Mutex::new((BinaryHeap::new(), 0)),
@@ -180,9 +182,14 @@ impl Embedder {
         }
 
         let embedder = Embedder { shared, _library: library, _strings: strings };
-        embedder.send_metrics();
+        embedder.send_metrics(geometry);
         embedder.send_locale(&config.locale);
         embedder.send_lifecycle("AppLifecycleState.resumed");
+        for message in &early {
+            if !embedder.handle(message) {
+                return Err("AERA closed the plugin while it started".into());
+            }
+        }
         Ok(embedder)
     }
 
@@ -190,12 +197,12 @@ impl Embedder {
         self.shared.engine.load(Ordering::Acquire)
     }
 
-    fn send_metrics(&self) {
+    fn send_metrics(&self, geometry: Geometry) {
         let mut metrics: FlutterWindowMetricsEvent = unsafe { std::mem::zeroed() };
         metrics.struct_size = std::mem::size_of::<FlutterWindowMetricsEvent>();
-        metrics.width = bridge::WIDTH as usize;
-        metrics.height = bridge::HEIGHT as usize;
-        metrics.pixel_ratio = bridge::DEVICE_SCALE;
+        metrics.width = geometry.width as usize;
+        metrics.height = geometry.height as usize;
+        metrics.pixel_ratio = geometry.scale;
         unsafe { self.shared.procs.SendWindowMetricsEvent.unwrap()(self.engine(), &metrics) };
     }
 
@@ -215,7 +222,7 @@ impl Embedder {
         self.shared.send_message("flutter/lifecycle", state.as_bytes());
     }
 
-    fn pointer(&self, phases: &[FlutterPointerPhase], packet: &Packet) {
+    fn pointer(&self, phases: &[FlutterPointerPhase], message: &Message) {
         let time = unsafe { self.shared.procs.GetCurrentTime.unwrap()() } / 1000;
         let events: Vec<FlutterPointerEvent> = phases
             .iter()
@@ -224,9 +231,10 @@ impl Embedder {
                 event.struct_size = std::mem::size_of::<FlutterPointerEvent>();
                 event.phase = phase;
                 event.timestamp = time as usize;
-                event.x = packet.x as f64 * bridge::DEVICE_SCALE;
-                event.y = packet.y as f64 * bridge::DEVICE_SCALE;
-                event.device = packet.value as i32;
+                // ASSUMED: touches arrive in surface pixels, like Flutter's.
+                event.x = message.value as f64;
+                event.y = message.flags as f64;
+                event.device = message.request_id as i32;
                 event.device_kind = kFlutterPointerDeviceKindTouch;
                 event
             })
@@ -234,13 +242,13 @@ impl Embedder {
         unsafe { self.shared.procs.SendPointerEvent.unwrap()(self.engine(), events.as_ptr(), events.len()) };
     }
 
-    /// Runs the platform thread until AERA closes the bridge.
+    /// Runs the platform thread until AERA stops the plugin.
     pub fn run(self) -> i32 {
         let shared = &*self.shared;
         let mut code = 0;
         while !shared.closed.load(Ordering::Acquire) {
             // Run every platform task that is due, then sleep until the next
-            // one, a bridge packet or a newly posted task.
+            // one, a host message or a newly posted task.
             let now = unsafe { shared.procs.GetCurrentTime.unwrap()() };
             let mut due = Vec::new();
             let mut timeout_ms = -1;
@@ -276,8 +284,8 @@ impl Embedder {
             }
             if fds[0].revents & libc::POLLIN != 0 {
                 match shared.control.recv(Some(Duration::ZERO)) {
-                    Ok(Some(packet)) if packet.valid_from_host() => {
-                        if !self.handle(&packet) {
+                    Ok(Some(message)) if kind::from_host(message.kind) => {
+                        if !self.handle(&message) {
                             break;
                         }
                     }
@@ -295,29 +303,34 @@ impl Embedder {
         code
     }
 
-    /// Returns false when the worker should stop.
-    fn handle(&self, packet: &Packet) -> bool {
+    /// Returns false when the plugin should stop.
+    fn handle(&self, message: &Message) -> bool {
         let shared = &*self.shared;
-        match packet.kind {
-            kind::ACK => {
+        match message.kind {
+            kind::FRAME_DONE => {
                 let mut state = shared.frame_state.lock().unwrap();
-                if !state.pending || packet.sequence != state.sequence {
+                if !state.pending || message.request_id != state.sequence {
                     return false;
                 }
                 state.pending = false;
                 shared.frame_acked.notify_all();
             }
-            kind::TOUCH_DOWN => self.pointer(&[kAdd, kDown], packet),
-            kind::TOUCH_MOVE => self.pointer(&[kMove], packet),
-            kind::TOUCH_UP => self.pointer(&[kUp, kRemove], packet),
+            kind::TOUCH_DOWN => self.pointer(&[kAdd, kDown], message),
+            kind::TOUCH_MOVE => self.pointer(&[kMove], message),
+            kind::TOUCH_UP => self.pointer(&[kUp, kRemove], message),
             kind::KEY => {
-                let effects = shared.text_input.lock().unwrap().key(packet.value);
+                let effects = shared.text_input.lock().unwrap().key(message.value);
                 shared.apply(effects);
             }
             kind::BACK => shared.send_message("flutter/navigation", br#"{"method":"popRoute","args":null}"#),
-            kind::CLOSE => return false,
-            // Browser-only requests (addresses, zoom, cookies, downloads)
-            // have no meaning for a Flutter app.
+            kind::LIFECYCLE => match message.value {
+                lifecycle::RESUME => self.send_lifecycle("AppLifecycleState.resumed"),
+                lifecycle::PAUSE => self.send_lifecycle("AppLifecycleState.paused"),
+                lifecycle::STOP => return false,
+                _ => {}
+            },
+            // Host API 2 page actions and operation results, and a repeated
+            // SURFACE, mean nothing to a Flutter app yet.
             _ => {}
         }
         true
@@ -345,12 +358,10 @@ impl Shared {
         for effect in effects {
             match effect {
                 Effect::ShowKeyboard { purpose } => {
-                    let mut packet = Packet::new(kind::KEYBOARD_SHOW);
-                    packet.value = purpose;
-                    let _ = self.control.send(&packet);
+                    let _ = self.control.send(&Message { value: purpose, ..Message::new(kind::KEYBOARD_SHOW) });
                 }
                 Effect::HideKeyboard => {
-                    let _ = self.control.send(&Packet::new(kind::KEYBOARD_HIDE));
+                    let _ = self.control.send(&Message::new(kind::KEYBOARD_HIDE));
                 }
                 Effect::ToFlutter(call) => self.send_message("flutter/textinput", call.to_string().as_bytes()),
             }
@@ -377,6 +388,8 @@ impl Shared {
             }
             "flutter/platform" => match method {
                 "SystemNavigator.pop" => {
+                    // Host API 2's CLOSE asks AERA to leave the plugin.
+                    let _ = self.control.send(&Message::new(kind::CLOSE));
                     self.closed.store(true, Ordering::Release);
                     self.wake();
                     Some(b"[null]".to_vec())
@@ -418,8 +431,8 @@ unsafe extern "C" fn proc_resolver(user_data: *mut c_void, name: *const c_char) 
     shared(user_data).gpu.proc_address(CStr::from_ptr(name))
 }
 
-/// Raster thread: copy the finished frame into the free slot and hand it to
-/// AERA, waiting first for AERA to release the previous one.
+/// Raster thread: copy the finished frame into the free slot and present it,
+/// waiting first for AERA to release the previous one.
 unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
     let s = shared(user_data);
     let mut state = s.frame_state.lock().unwrap();
@@ -432,14 +445,10 @@ unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
     let next = state.sequence.wrapping_add(1);
     {
         let mut scratch = s.scratch.lock().unwrap();
-        s.gpu.read_frame(&mut scratch, s.frames.slot(next));
+        s.gpu.read_frame(&mut scratch, s.surface.slot(next), s.surface.geometry().stride as usize);
     }
-    let mut packet = Packet::new(kind::FRAME);
-    packet.sequence = next;
-    packet.x = bridge::WIDTH;
-    packet.y = bridge::HEIGHT;
-    packet.value = bridge::FRAME_BYTES as u32;
-    if s.control.send(&packet).is_err() {
+    let present = Message { request_id: next, value: s.surface.slot_of(next), ..Message::new(kind::PRESENT) };
+    if s.control.send(&present).is_err() {
         s.closed.store(true, Ordering::Release);
         s.wake();
         return false;
@@ -477,7 +486,8 @@ unsafe extern "C" fn platform_message(message: *const FlutterPlatformMessage, us
     s.respond(message.response_handle, &reply);
 }
 
-/// Default runtime layout inside the payload (the jail's `/`).
+/// Default runtime layout inside the payload, which AERA extracts to the
+/// directory named in `AERA_PLUGIN_ROOT`.
 pub fn default_config(root: &Path) -> Config {
     let share = root.join("usr/share/flutter");
     Config {
@@ -486,8 +496,7 @@ pub fn default_config(root: &Path) -> Config {
         icu_data: share.join("icudtl.dat"),
         aot_library: root.join("usr/lib/libapp.so"),
         locale: std::env::var("AERA_LOCALE").unwrap_or_else(|_| "en".into()),
-        // AERA's jail seccomp policy denies listen(), so the Dart VM
-        // service could never accept connections there anyway.
+        // Nobody can reach the Dart VM service on the phone, so don't open it.
         extra_engine_args: vec!["--disable-vm-service".into()],
     }
 }

@@ -1,6 +1,6 @@
 //! Offscreen OpenGL ES through EGL's Mesa surfaceless platform.
 //!
-//! On the phone this is the same stack AERA Browser uses: Mesa EGL → Zink →
+//! On the phone this is the stack AERA Browser also uses: Mesa EGL → Zink →
 //! Turnip → `/dev/kgsl-3d0`. On a PC it is whatever Mesa driver is present
 //! (llvmpipe in CI). Nothing here touches a display; Flutter draws into a
 //! framebuffer object and [`Gpu::read_frame`] copies it out.
@@ -232,22 +232,22 @@ impl Gpu {
         }
     }
 
-    /// Copies the finished frame into `out` as top-down ARGB8888 (B, G, R, A
-    /// bytes in memory), the layout AERA's browser bridge expects.
+    /// Copies the finished frame into `out` as top-down BGRA8888 rows of
+    /// `stride` bytes, the layout of AERA's pixel surface.
     /// `scratch` must hold `width * height * 4` bytes.
-    pub fn read_frame(&self, scratch: &mut [u8], out: &mut [u8]) {
+    pub fn read_frame(&self, scratch: &mut [u8], out: &mut [u8], stride: usize) {
         let row = self.width as usize * 4;
         let bytes = row * self.height as usize;
-        assert!(scratch.len() >= bytes && out.len() >= bytes);
+        assert!(stride >= row && scratch.len() >= bytes && out.len() >= stride * self.height as usize);
         unsafe {
             let g = &self.gles;
             (g.bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer());
             (g.pixel_storei)(GL_PACK_ALIGNMENT, 4);
             (g.read_pixels)(0, 0, self.width, self.height, GL_RGBA, GL_UNSIGNED_BYTE, scratch.as_mut_ptr().cast());
         }
-        // GL rows run bottom-up and RGBA; the bridge wants top-down BGRA.
+        // GL rows run bottom-up and RGBA; the surface wants top-down BGRA.
         for (y, source) in scratch[..bytes].chunks_exact(row).enumerate() {
-            let target = &mut out[(self.height as usize - 1 - y) * row..][..row];
+            let target = &mut out[(self.height as usize - 1 - y) * stride..][..row];
             for (s, t) in source.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
                 t[0] = s[2];
                 t[1] = s[1];

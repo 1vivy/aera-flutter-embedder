@@ -1,0 +1,10 @@
+[package]
+name = "aera-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The executable AERA starts; enters the runtime's own loader and runs aera-flutter"
+publish = false
+
+[dependencies]
+libc = "0.2"

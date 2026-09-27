@@ -1,7 +1,7 @@
 //! The `flutter/textinput` channel, driven by AERA's native keyboard.
 //!
-//! AERA shows its keyboard when the worker sends `KEYBOARD_SHOW` and delivers
-//! each key as a `KEY` packet holding one Unicode code point (8 is backspace,
+//! AERA shows its keyboard when the plugin sends `KEYBOARD_SHOW` and delivers
+//! each key as a `KEY` message holding one Unicode code point (8 is backspace,
 //! 13 is enter). Flutter expects an input method that keeps the editing state
 //! and reports it back, so this module is that input method.
 

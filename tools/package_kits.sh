@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Package the two kits that apps built from aera-flutter-template download:
 #
-#   aera-flutter-runtime-arm64-<flutter>.tar.xz  everything the app needs in
-#       AERA's jail except the app: glibc, Flutter engine, Mesa, fonts and
-#       this embedder (from tools/assemble_runtime.py)
-#   aera-flutter-simkit-x64-<flutter>.tar.xz     the embedder, the host
-#       simulator and the x64 engine, for running apps on a PC
+#   aera-flutter-runtime-arm64-<flutter>.tar.xz  everything the app needs on
+#       AERA's pixel host except the app: glibc, Flutter engine, Mesa, fonts,
+#       aera-plugin and aera-flutter (from tools/assemble_runtime.py)
+#   aera-flutter-simkit-x64-<flutter>.tar.xz     aera-plugin, aera-flutter,
+#       the host simulator and the x64 engine, for running apps on a PC
 #
 # The engine is a debug (JIT) engine, so an app must be built with exactly the
 # Flutter release named in the kit; each kit records it in `flutter-version`.
@@ -26,9 +26,10 @@ printf '%s\n' "$engine_hash" > "$work/runtime/engine-revision"
 tar -C "$work/runtime" -cJf "$out/aera-flutter-runtime-arm64-$flutter_version.tar.xz" .
 
 cargo build --release --features sim
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p aera-plugin --target x86_64-unknown-linux-gnu
 kit=$work/simkit
 mkdir -p "$kit/bin" "$kit/usr/lib" "$kit/usr/share/flutter"
-cp target/release/aera-browser-worker target/release/aera-host-sim "$kit/bin/"
+cp target/x86_64-unknown-linux-gnu/release/aera-plugin target/release/aera-flutter target/release/aera-host-sim "$kit/bin/"
 cp "$engine_x64" "$kit/usr/lib/libflutter_engine.so"
 cp "$icu" "$kit/usr/share/flutter/icudtl.dat"
 printf '%s\n' "$flutter_version" > "$kit/flutter-version"

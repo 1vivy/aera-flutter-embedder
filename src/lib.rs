@@ -1,12 +1,14 @@
-//! Flutter embedder for AERA Recovery's browser slot.
+//! Flutter embedder for AERA Recovery's generic pixel + GPU plugin host.
 //!
-//! The binary `aera-browser-worker` is the embedder; `aera-host-sim` plays
-//! AERA's side of the bridge on a PC so the embedder can be tested without a
-//! phone.
+//! `aera-plugin` is the executable AERA starts; it enters the runtime's own
+//! glibc loader and runs `aera-flutter`, the embedder. `aera-host-sim` plays
+//! AERA's side on a PC so the embedder can be tested without a phone.
+//!
+//! The host is not released yet: [`host`] holds every assumption about it.
 
-pub mod bridge;
 pub mod engine;
 #[allow(dead_code)]
 mod ffi;
 pub mod gl;
+pub mod host;
 pub mod text_input;

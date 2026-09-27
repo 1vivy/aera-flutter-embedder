@@ -3,12 +3,15 @@ name = "aera-flutter-embedder"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Runs a Flutter app inside AERA Recovery's GPU browser host"
+description = "Runs a Flutter app on AERA Recovery's generic pixel + GPU plugin host"
 publish = false
 
+[workspace]
+members = [".", "launcher"]
+
 [[bin]]
-name = "aera-browser-worker"
-path = "src/main.rs"
+name = "aera-flutter"
+path = "src/bin/aera_flutter.rs"
 
 [[bin]]
 name = "aera-host-sim"
