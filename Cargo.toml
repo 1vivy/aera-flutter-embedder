@@ -1,0 +1,35 @@
+[package]
+name = "aera-flutter-embedder"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Runs a Flutter app inside AERA Recovery's GPU browser host"
+publish = false
+
+[[bin]]
+name = "aera-browser-worker"
+path = "src/main.rs"
+
+[[bin]]
+name = "aera-host-sim"
+path = "src/bin/host_sim.rs"
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
+serde_json = "1"
+png = { version = "0.17", optional = true }
+
+[build-dependencies]
+bindgen = { version = "0.70", default-features = false, features = ["runtime"] }
+
+[features]
+default = ["sim"]
+# The PC stand-in for AERA writes frames as PNG files.
+sim = ["dep:png"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
