@@ -337,3 +337,18 @@ impl Gpu {
         unsafe { (self.gles.finish)() }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Region;
+
+    #[test]
+    fn region_union_and_clamp() {
+        let a = Region { x: 10, y: 10, width: 10, height: 10 };
+        let b = Region { x: 30, y: 5, width: 5, height: 5 };
+        assert_eq!(a.union(b), Region { x: 10, y: 5, width: 25, height: 15 });
+        assert_eq!(Region::default().union(a), a);
+        let wide = Region { x: -5, y: 2090, width: 2000, height: 50 };
+        assert_eq!(wide.clamp(1080, 2100), Region { x: 0, y: 2090, width: 1080, height: 10 });
+    }
+}
