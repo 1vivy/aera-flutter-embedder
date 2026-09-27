@@ -12,8 +12,6 @@
 //!
 //! Times are milliseconds after the first frame; taps use AERA's 360x700 view
 //! pixels.
-//! ```text
-//! ```
 
 use std::fs::File;
 use std::io::BufWriter;
