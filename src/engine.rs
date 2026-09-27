@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use crate::bridge::{self, kind, Control, Frames, Packet};
 use crate::ffi::*;
 use crate::gl::{Gpu, Region};
+use crate::vk::Vulkan;
 use crate::text_input::{Effect, TextInput};
 
 pub struct Config {
@@ -25,6 +26,21 @@ pub struct Config {
     pub aot_library: PathBuf,
     pub locale: String,
     pub extra_engine_args: Vec<String>,
+    pub renderer: Renderer,
+}
+
+/// How Flutter draws. `Gl` goes through Mesa's Zink to Vulkan; `Vulkan`
+/// hands Flutter a Vulkan device directly (Skia, or Impeller with the
+/// engine's `--enable-impeller` flag).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renderer {
+    Gl,
+    Vulkan,
+}
+
+enum Backend {
+    Gl(Gpu),
+    Vulkan(Vulkan),
 }
 
 struct FrameState {
@@ -56,7 +72,7 @@ struct Queued {
 struct Shared {
     procs: FlutterEngineProcTable,
     engine: AtomicPtr<_FlutterEngine>,
-    gpu: Gpu,
+    gpu: Backend,
     frames: Frames,
     control: Control,
     frame_state: Mutex<FrameState>,
@@ -116,7 +132,10 @@ impl Embedder {
                 return Err("FlutterEngineGetProcAddresses failed".into());
             }
         }
-        let gpu = Gpu::new(bridge::WIDTH, bridge::HEIGHT)?;
+        let gpu = match config.renderer {
+            Renderer::Gl => Backend::Gl(Gpu::new(bridge::WIDTH, bridge::HEIGHT)?),
+            Renderer::Vulkan => Backend::Vulkan(Vulkan::new(bridge::WIDTH as u32, bridge::HEIGHT as u32)?),
+        };
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake < 0 {
             return Err("eventfd failed".into());
@@ -154,6 +173,37 @@ impl Embedder {
 
         let user_data = &*shared as *const Shared as *mut c_void;
         let mut renderer: FlutterRendererConfig = unsafe { std::mem::zeroed() };
+        // Must stay alive until FlutterEngineInitialize has returned.
+        let mut device_extensions: Vec<*const std::ffi::c_char> = match &shared.gpu {
+            Backend::Vulkan(vulkan) => vulkan.reported_device_extensions(),
+            Backend::Gl(_) => Vec::new(),
+        };
+        let mut instance_extensions: Vec<*const std::ffi::c_char> = match &shared.gpu {
+            Backend::Vulkan(vulkan) => vulkan.reported_instance_extensions(),
+            Backend::Gl(_) => Vec::new(),
+        };
+        if let Backend::Vulkan(vulkan) = &shared.gpu {
+            eprintln!("aera-flutter: Vulkan on {}", vulkan.device_name());
+            let (instance, physical_device, device, queue_family_index, queue) = vulkan.handles();
+            renderer.type_ = kVulkan;
+            unsafe {
+                let vk = &mut renderer.__bindgen_anon_1.vulkan;
+                vk.struct_size = std::mem::size_of::<FlutterVulkanRendererConfig>();
+                vk.version = vulkan.api_version();
+                vk.instance = instance;
+                vk.physical_device = physical_device;
+                vk.device = device;
+                vk.queue_family_index = queue_family_index;
+                vk.queue = queue;
+                vk.enabled_instance_extension_count = instance_extensions.len();
+                vk.enabled_instance_extensions = instance_extensions.as_mut_ptr();
+                vk.enabled_device_extension_count = device_extensions.len();
+                vk.enabled_device_extensions = device_extensions.as_mut_ptr();
+                vk.get_instance_proc_address_callback = Some(vulkan_proc_address);
+                vk.get_next_image_callback = Some(vulkan_next_image);
+                vk.present_image_callback = Some(vulkan_present);
+            }
+        } else {
         renderer.type_ = kOpenGL;
         unsafe {
             let gl = &mut renderer.__bindgen_anon_1.open_gl;
@@ -166,6 +216,7 @@ impl Embedder {
             gl.make_resource_current = Some(make_resource_current);
             gl.gl_proc_resolver = Some(proc_resolver);
             gl.surface_transformation = Some(flip_vertically);
+        }
         }
 
         let platform_runner = FlutterTaskRunnerDescription {
@@ -458,16 +509,32 @@ impl Shared {
     }
 }
 
+impl Shared {
+    fn gl(&self) -> &Gpu {
+        match &self.gpu {
+            Backend::Gl(gpu) => gpu,
+            Backend::Vulkan(_) => unreachable!("GL callback with the Vulkan renderer"),
+        }
+    }
+
+    fn vulkan(&self) -> &Vulkan {
+        match &self.gpu {
+            Backend::Vulkan(vulkan) => vulkan,
+            Backend::Gl(_) => unreachable!("Vulkan callback with the GL renderer"),
+        }
+    }
+}
+
 unsafe fn shared<'a>(user_data: *mut c_void) -> &'a Shared {
     &*(user_data as *const Shared)
 }
 
 unsafe extern "C" fn make_current(user_data: *mut c_void) -> bool {
-    shared(user_data).gpu.make_render_current()
+    shared(user_data).gl().make_render_current()
 }
 
 unsafe extern "C" fn clear_current(user_data: *mut c_void) -> bool {
-    shared(user_data).gpu.clear_current()
+    shared(user_data).gl().clear_current()
 }
 
 /// There is no resource context: Flutter then uploads images on the raster
@@ -504,11 +571,11 @@ unsafe extern "C" fn request_vsync(user_data: *mut c_void, baton: isize) {
 }
 
 unsafe extern "C" fn fbo_callback(user_data: *mut c_void, _info: *const FlutterFrameInfo) -> u32 {
-    shared(user_data).gpu.framebuffer()
+    shared(user_data).gl().framebuffer()
 }
 
 unsafe extern "C" fn proc_resolver(user_data: *mut c_void, name: *const c_char) -> *mut c_void {
-    shared(user_data).gpu.proc_address(CStr::from_ptr(name))
+    shared(user_data).gl().proc_address(CStr::from_ptr(name))
 }
 
 /// Our framebuffer keeps the previous frame, so nothing needs repainting
@@ -542,26 +609,23 @@ fn damage_bounds(damage: &FlutterDamage) -> Option<Region> {
 unsafe extern "C" fn present(user_data: *mut c_void, info: *const FlutterPresentInfo) -> bool {
     let s = shared(user_data);
     let damage = if std::env::var_os("AERA_FLUTTER_FULL_FRAMES").is_some() { None } else { damage_bounds(&(*info).frame_damage) };
-    let waited = std::time::Instant::now();
-    let mut state = s.frame_state.lock().unwrap();
-    while state.pending && !s.closed.load(Ordering::Acquire) {
-        state = s.frame_acked.wait_timeout(state, Duration::from_millis(250)).unwrap().0;
-    }
-    if s.closed.load(Ordering::Acquire) {
-        return false;
-    }
-    let ack_wait = waited.elapsed();
+    let Some((mut state, ack_wait)) = wait_for_ack(s) else { return false };
     let next = state.sequence.wrapping_add(1);
     let region = match (damage, state.last_damage) {
         (Some(now), Some(before)) => Some(now.union(before)),
         _ => None,
     };
     state.last_damage = damage;
-    let (readback, convert) = s.gpu.read_frame(s.frames.slot(next), region);
+    let (readback, convert) = s.gl().read_frame(s.frames.slot(next), region);
     if let Some(stats) = &s.stats {
         let area = region.map_or(1.0, |r| r.area() as f64 / (bridge::WIDTH as f64 * bridge::HEIGHT as f64));
         stats.lock().unwrap().add(ack_wait, readback, convert, area);
     }
+    send_frame(s, state, next)
+}
+
+/// Hands the filled slot for `next` to AERA.
+fn send_frame(s: &Shared, mut state: std::sync::MutexGuard<'_, FrameState>, next: u32) -> bool {
     let mut packet = Packet::new(kind::FRAME);
     packet.sequence = next;
     packet.x = bridge::WIDTH;
@@ -575,6 +639,45 @@ unsafe extern "C" fn present(user_data: *mut c_void, info: *const FlutterPresent
     state.sequence = next;
     state.pending = true;
     true
+}
+
+/// Waits until AERA has released the previous frame. None when closing.
+fn wait_for_ack(s: &Shared) -> Option<(std::sync::MutexGuard<'_, FrameState>, Duration)> {
+    let waited = std::time::Instant::now();
+    let mut state = s.frame_state.lock().unwrap();
+    while state.pending && !s.closed.load(Ordering::Acquire) {
+        state = s.frame_acked.wait_timeout(state, Duration::from_millis(250)).unwrap().0;
+    }
+    if s.closed.load(Ordering::Acquire) {
+        return None;
+    }
+    Some((state, waited.elapsed()))
+}
+
+unsafe extern "C" fn vulkan_proc_address(user_data: *mut c_void, instance: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void {
+    shared(user_data).vulkan().instance_proc_address(instance, CStr::from_ptr(name))
+}
+
+unsafe extern "C" fn vulkan_next_image(user_data: *mut c_void, _info: *const FlutterFrameInfo) -> FlutterVulkanImage {
+    let (image, format) = shared(user_data).vulkan().next_image();
+    FlutterVulkanImage { struct_size: std::mem::size_of::<FlutterVulkanImage>(), image, format }
+}
+
+/// Raster thread: Flutter finished drawing `image` and waited for the GPU.
+unsafe extern "C" fn vulkan_present(user_data: *mut c_void, image: *const FlutterVulkanImage) -> bool {
+    let s = shared(user_data);
+    let Some((mut state, ack_wait)) = wait_for_ack(s) else { return false };
+    let next = state.sequence.wrapping_add(1);
+    let start = std::time::Instant::now();
+    if let Err(error) = s.vulkan().read_frame((*image).image, s.frames.slot(next)) {
+        eprintln!("aera-flutter: {error}");
+        return false;
+    }
+    if let Some(stats) = &s.stats {
+        stats.lock().unwrap().add(ack_wait, start.elapsed(), Duration::ZERO, 1.0);
+    }
+    state.last_damage = None;
+    send_frame(s, state, next)
 }
 
 unsafe extern "C" fn runs_on_platform_thread(user_data: *mut c_void) -> bool {
@@ -608,14 +711,31 @@ unsafe extern "C" fn platform_message(message: *const FlutterPlatformMessage, us
 /// Default runtime layout inside the payload (the jail's `/`).
 pub fn default_config(root: &Path) -> Config {
     let share = root.join("usr/share/flutter");
+    // AERA's jail seccomp policy denies listen(), so the Dart VM service
+    // could never accept connections there anyway.
+    let mut extra_engine_args = vec!["--disable-vm-service".to_string()];
+    // `usr/share/flutter/renderer` (or AERA_FLUTTER_RENDERER) picks the
+    // renderer: `gl` (default), `vulkan` (Skia) or `impeller` (Impeller on
+    // Vulkan).
+    let choice = std::env::var("AERA_FLUTTER_RENDERER")
+        .ok()
+        .or_else(|| std::fs::read_to_string(share.join("renderer")).ok())
+        .unwrap_or_default();
+    let renderer = match choice.trim() {
+        "vulkan" => Renderer::Vulkan,
+        "impeller" => {
+            extra_engine_args.push("--enable-impeller=true".into());
+            Renderer::Vulkan
+        }
+        _ => Renderer::Gl,
+    };
     Config {
         engine_library: root.join("usr/lib/libflutter_engine.so"),
         assets: share.join("flutter_assets"),
         icu_data: share.join("icudtl.dat"),
         aot_library: root.join("usr/lib/libapp.so"),
         locale: std::env::var("AERA_LOCALE").unwrap_or_else(|_| "en".into()),
-        // AERA's jail seccomp policy denies listen(), so the Dart VM
-        // service could never accept connections there anyway.
-        extra_engine_args: vec!["--disable-vm-service".into()],
+        extra_engine_args,
+        renderer,
     }
 }
