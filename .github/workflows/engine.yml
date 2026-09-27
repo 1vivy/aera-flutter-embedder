@@ -60,6 +60,38 @@ jobs:
           cd "$RUNNER_TEMP/smoke" && flutter pub get
           "$GITHUB_WORKSPACE/tools/build_aot_app.sh" "${{ matrix.mode }}" "$kit" out
           file out/libapp.so | tee /dev/stderr | grep -q 'ARM aarch64'
+      - name: Run the app on the engine under qemu
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static libclang-dev gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+          cargo build --release --bin aera-host-sim
+          cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --bin aera-browser-worker
+          # The published runtime kit supplies glibc and Mesa; swap in this
+          # engine, this worker and the AOT app.
+          root=$RUNNER_TEMP/root && mkdir -p "$root"
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/flutter-$FLUTTER_VERSION/aera-flutter-runtime-arm64-$FLUTTER_VERSION.tar.xz" \
+            | tar -C "$root" -xJ
+          cp "$RUNNER_TEMP/kit/usr/lib/libflutter_engine.so" "$RUNNER_TEMP/smoke/out/libapp.so" "$root/usr/lib/"
+          cp target/aarch64-unknown-linux-gnu/release/aera-browser-worker "$root/usr/bin/"
+          rm -rf "$root/usr/share/flutter/flutter_assets"
+          cp -r "$RUNNER_TEMP/smoke/out/flutter_assets" "$root/usr/share/flutter/"
+          readelf -d "$root/usr/lib/libflutter_engine.so" | grep NEEDED
+          for lib in $(readelf -d "$root/usr/lib/libflutter_engine.so" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+            [ -e "$root/lib/$lib" ] || [ -e "$root/usr/lib/$lib" ] || { echo "runtime kit lacks $lib" >&2; exit 1; }
+          done
+          QEMU_LD_PREFIX=$root GALLIUM_DRIVER=softpipe target/release/aera-host-sim \
+            --worker "$root/usr/bin/aera-browser-worker" --root "$root" \
+            --out frames --timeout 600 --until 3000 --save-at 2500
+          ls -l frames
+          # A blank 1080x2100 frame compresses to a few KB; the counter app does not.
+          [ "$(stat -c %s frames/at-02500ms.png)" -gt 20000 ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frames-${{ matrix.mode }}
+          path: frames/
       - uses: actions/upload-artifact@v4
         with:
           name: engine-${{ matrix.mode }}
