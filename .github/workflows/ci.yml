@@ -1,0 +1,11 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev gcc-aarch64-linux-gnu
+      - run: rustup target add aarch64-unknown-linux-gnu
+      - run: cargo test
+      - run: cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --bin aera-browser-worker
