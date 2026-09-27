@@ -32,7 +32,14 @@ struct FrameState {
     sequence: u32,
     /// A frame is out and AERA has not acknowledged it yet.
     pending: bool,
+    /// Flutter's request for the next vsync, answered once AERA has taken the
+    /// previous frame and a frame period has passed since the last vsync.
+    vsync_baton: Option<isize>,
+    last_vsync: u64,
 }
+
+/// AERA does not report its display rate; pace at 60 Hz at most.
+const FRAME_PERIOD_NS: u64 = 16_666_667;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Queued {
@@ -50,12 +57,38 @@ struct Shared {
     control: Control,
     frame_state: Mutex<FrameState>,
     frame_acked: Condvar,
-    scratch: Mutex<Vec<u8>>,
     closed: AtomicBool,
     platform_thread: ThreadId,
     tasks: Mutex<(BinaryHeap<Reverse<Queued>>, u64)>,
     wake: i32,
     text_input: Mutex<TextInput>,
+    stats: Option<Mutex<FrameStats>>,
+}
+
+/// Per-frame costs, printed every 120 frames when AERA_FLUTTER_STATS is set.
+#[derive(Default)]
+struct FrameStats {
+    frames: u32,
+    ack_wait: Duration,
+    readback: Duration,
+    convert: Duration,
+}
+
+impl FrameStats {
+    fn add(&mut self, ack_wait: Duration, readback: Duration, convert: Duration) {
+        self.frames += 1;
+        self.ack_wait += ack_wait;
+        self.readback += readback;
+        self.convert += convert;
+        if self.frames == 120 {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0 / 120.0;
+            eprintln!(
+                "aera-flutter: per frame over 120: ack wait {:.2} ms, readback {:.2} ms, swizzle {:.2} ms",
+                ms(self.ack_wait), ms(self.readback), ms(self.convert)
+            );
+            *self = FrameStats::default();
+        }
+    }
 }
 
 pub struct Embedder {
@@ -88,9 +121,9 @@ impl Embedder {
             gpu,
             frames,
             control,
-            frame_state: Mutex::new(FrameState { sequence: 0, pending: false }),
+            frame_state: Mutex::new(FrameState { sequence: 0, pending: false, vsync_baton: None, last_vsync: 0 }),
             frame_acked: Condvar::new(),
-            scratch: Mutex::new(vec![0; bridge::FRAME_BYTES]),
+            stats: std::env::var_os("AERA_FLUTTER_STATS").map(|_| Mutex::new(FrameStats::default())),
             closed: AtomicBool::new(false),
             platform_thread: std::thread::current().id(),
             tasks: Mutex::new((BinaryHeap::new(), 0)),
@@ -125,6 +158,7 @@ impl Embedder {
             gl.fbo_callback = Some(fbo_callback);
             gl.make_resource_current = Some(make_resource_current);
             gl.gl_proc_resolver = Some(proc_resolver);
+            gl.surface_transformation = Some(flip_vertically);
         }
 
         let platform_runner = FlutterTaskRunnerDescription {
@@ -149,6 +183,7 @@ impl Embedder {
         args.command_line_argv = argv.as_ptr();
         args.platform_message_callback = Some(platform_message);
         args.custom_task_runners = &runners;
+        args.vsync_callback = Some(request_vsync);
         args.shutdown_dart_vm_when_done = true;
         args.log_tag = tag;
 
@@ -243,14 +278,15 @@ impl Embedder {
             // one, a bridge packet or a newly posted task.
             let now = unsafe { shared.procs.GetCurrentTime.unwrap()() };
             let mut due = Vec::new();
-            let mut timeout_ms = -1;
+            let mut timeout_ms = self.answer_vsync(now);
             {
                 let mut tasks = shared.tasks.lock().unwrap();
                 while let Some(Reverse(next)) = tasks.0.peek() {
                     if next.target <= now {
                         due.push(tasks.0.pop().unwrap().0);
                     } else {
-                        timeout_ms = ((next.target - now) / 1_000_000).clamp(0, 1000) as i32;
+                        let wait = ((next.target - now) / 1_000_000).clamp(0, 1000) as i32;
+                        timeout_ms = if timeout_ms < 0 { wait } else { timeout_ms.min(wait) };
                         break;
                     }
                 }
@@ -293,6 +329,27 @@ impl Embedder {
         shared.frame_acked.notify_all();
         unsafe { shared.procs.Shutdown.unwrap()(self.engine()) };
         code
+    }
+
+    /// Answers Flutter's pending vsync request when AERA holds no unacknowledged
+    /// frame and a frame period has passed. Returns how long the platform loop
+    /// may sleep before checking again, or -1 when nothing is waiting.
+    fn answer_vsync(&self, now: u64) -> i32 {
+        let shared = &*self.shared;
+        let mut state = shared.frame_state.lock().unwrap();
+        let Some(baton) = state.vsync_baton else { return -1 };
+        if state.pending {
+            return -1; // the ACK handler wakes the loop
+        }
+        let earliest = state.last_vsync + FRAME_PERIOD_NS;
+        if now < earliest {
+            return ((earliest - now) / 1_000_000).max(1) as i32;
+        }
+        state.vsync_baton = None;
+        state.last_vsync = now;
+        drop(state);
+        unsafe { shared.procs.OnVsync.unwrap()(self.engine(), baton, now, now + FRAME_PERIOD_NS) };
+        -1
     }
 
     /// Returns false when the worker should stop.
@@ -415,6 +472,30 @@ unsafe extern "C" fn make_resource_current(_user_data: *mut c_void) -> bool {
     false
 }
 
+/// Draws every frame upside down. GL reads rows bottom-up, so the readback
+/// then lands top-down in AERA's frame slot with no CPU pass.
+unsafe extern "C" fn flip_vertically(_user_data: *mut c_void) -> FlutterTransformation {
+    FlutterTransformation {
+        scaleX: 1.0,
+        skewX: 0.0,
+        transX: 0.0,
+        skewY: 0.0,
+        scaleY: -1.0,
+        transY: bridge::HEIGHT as f64,
+        pers0: 0.0,
+        pers1: 0.0,
+        pers2: 1.0,
+    }
+}
+
+/// Flutter wants to start a frame. Called on the UI thread; the platform loop
+/// answers it (see `Embedder::answer_vsync`).
+unsafe extern "C" fn request_vsync(user_data: *mut c_void, baton: isize) {
+    let s = shared(user_data);
+    s.frame_state.lock().unwrap().vsync_baton = Some(baton);
+    s.wake();
+}
+
 unsafe extern "C" fn fbo_callback(user_data: *mut c_void) -> u32 {
     shared(user_data).gpu.framebuffer()
 }
@@ -427,6 +508,7 @@ unsafe extern "C" fn proc_resolver(user_data: *mut c_void, name: *const c_char) 
 /// AERA, waiting first for AERA to release the previous one.
 unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
     let s = shared(user_data);
+    let waited = std::time::Instant::now();
     let mut state = s.frame_state.lock().unwrap();
     while state.pending && !s.closed.load(Ordering::Acquire) {
         state = s.frame_acked.wait_timeout(state, Duration::from_millis(250)).unwrap().0;
@@ -434,10 +516,11 @@ unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
     if s.closed.load(Ordering::Acquire) {
         return false;
     }
+    let ack_wait = waited.elapsed();
     let next = state.sequence.wrapping_add(1);
-    {
-        let mut scratch = s.scratch.lock().unwrap();
-        s.gpu.read_frame(&mut scratch, s.frames.slot(next));
+    let (readback, convert) = s.gpu.read_frame(s.frames.slot(next));
+    if let Some(stats) = &s.stats {
+        stats.lock().unwrap().add(ack_wait, readback, convert);
     }
     let mut packet = Packet::new(kind::FRAME);
     packet.sequence = next;

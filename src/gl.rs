@@ -47,6 +47,8 @@ const GL_RGBA: GLenum = 0x1908;
 const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 const GL_PACK_ALIGNMENT: GLenum = 0x0D05;
 const GL_RENDERER: GLenum = 0x1F01;
+const GL_EXTENSIONS: GLenum = 0x1F03;
+const GL_BGRA_EXT: GLenum = 0x80E1;
 
 struct Egl {
     get_platform_display: unsafe extern "C" fn(EGLenum, *mut c_void, *const isize) -> EGLDisplay,
@@ -73,6 +75,7 @@ struct Gles {
     pixel_storei: unsafe extern "C" fn(GLenum, GLint),
     finish: unsafe extern "C" fn(),
     get_string: unsafe extern "C" fn(GLenum) -> *const u8,
+    get_error: unsafe extern "C" fn() -> GLenum,
 }
 
 /// An EGL display with two contexts: one Flutter renders with on the raster
@@ -87,6 +90,8 @@ pub struct Gpu {
     height: i32,
     /// Framebuffer object, created on the raster thread on first use.
     fbo: std::sync::atomic::AtomicU32,
+    /// 0 not yet checked, 1 GL_BGRA_EXT readback works, 2 it does not.
+    bgra_readback: std::sync::atomic::AtomicU8,
 }
 
 // EGL handles are process-wide; each context is only made current on the
@@ -161,6 +166,7 @@ impl Gpu {
                 pixel_storei: gl!("glPixelStorei"),
                 finish: gl!("glFinish"),
                 get_string: gl!("glGetString"),
+                get_error: gl!("glGetError"),
             };
             Ok(Gpu {
                 _library: library,
@@ -171,6 +177,7 @@ impl Gpu {
                 width,
                 height,
                 fbo: std::sync::atomic::AtomicU32::new(0),
+                bgra_readback: std::sync::atomic::AtomicU8::new(0),
             })
         }
     }
@@ -225,28 +232,56 @@ impl Gpu {
         }
     }
 
-    /// Copies the finished frame into `out` as top-down ARGB8888 (B, G, R, A
-    /// bytes in memory), the layout AERA's browser bridge expects.
-    /// `scratch` must hold `width * height * 4` bytes.
-    pub fn read_frame(&self, scratch: &mut [u8], out: &mut [u8]) {
-        let row = self.width as usize * 4;
-        let bytes = row * self.height as usize;
-        assert!(scratch.len() >= bytes && out.len() >= bytes);
+    /// Copies the finished frame into `out` (a frame slot) as top-down
+    /// ARGB8888, i.e. B, G, R, A bytes in memory, the layout AERA's browser
+    /// bridge expects. Flutter already draws the frame upside down (see
+    /// `engine::flip_vertically`), so GL's bottom-up rows come out top-down.
+    /// Where the driver offers GL_EXT_read_format_bgra the GPU also does the
+    /// swizzle; otherwise R and B are swapped in place.
+    /// Returns how long the GPU readback and the CPU swizzle took.
+    pub fn read_frame(&self, out: &mut [u8]) -> (std::time::Duration, std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let bytes = self.width as usize * self.height as usize * 4;
+        assert!(out.len() >= bytes);
+        let start = std::time::Instant::now();
+        let mut bgra = match self.bgra_readback.load(Ordering::Relaxed) {
+            0 => {
+                let supported = self.has_extension("GL_EXT_read_format_bgra");
+                self.bgra_readback.store(if supported { 1 } else { 2 }, Ordering::Relaxed);
+                supported
+            }
+            state => state == 1,
+        };
         unsafe {
             let g = &self.gles;
             (g.bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer());
             (g.pixel_storei)(GL_PACK_ALIGNMENT, 4);
-            (g.read_pixels)(0, 0, self.width, self.height, GL_RGBA, GL_UNSIGNED_BYTE, scratch.as_mut_ptr().cast());
-        }
-        // GL rows run bottom-up and RGBA; the bridge wants top-down BGRA.
-        for (y, source) in scratch[..bytes].chunks_exact(row).enumerate() {
-            let target = &mut out[(self.height as usize - 1 - y) * row..][..row];
-            for (s, t) in source.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
-                t[0] = s[2];
-                t[1] = s[1];
-                t[2] = s[0];
-                t[3] = s[3];
+            while (g.get_error)() != 0 {}
+            if bgra {
+                (g.read_pixels)(0, 0, self.width, self.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, out.as_mut_ptr().cast());
+                if (g.get_error)() != 0 {
+                    eprintln!("aera-flutter: BGRA readback refused, swizzling on the CPU");
+                    self.bgra_readback.store(2, Ordering::Relaxed);
+                    bgra = false;
+                }
             }
+            if !bgra {
+                (g.read_pixels)(0, 0, self.width, self.height, GL_RGBA, GL_UNSIGNED_BYTE, out.as_mut_ptr().cast());
+            }
+        }
+        let read = start.elapsed();
+        if !bgra {
+            for pixel in out[..bytes].chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        (read, start.elapsed() - read)
+    }
+
+    fn has_extension(&self, name: &str) -> bool {
+        unsafe {
+            let text = (self.gles.get_string)(GL_EXTENSIONS);
+            !text.is_null() && CStr::from_ptr(text.cast()).to_string_lossy().split(' ').any(|e| e == name)
         }
     }
 
