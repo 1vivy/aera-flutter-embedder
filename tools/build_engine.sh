@@ -81,7 +81,13 @@ gn_args=(
 ./flutter/tools/gn "${gn_args[@]}"
 # clang_x64/gen_snapshot is gen_snapshot built for the x64 host that emits
 # arm64 code; the default-toolchain gen_snapshot would be an arm64 binary.
-ninja -C "out/$target" flutter/shell/platform/embedder:flutter_engine clang_x64/gen_snapshot
+# The :flutter_engine group is empty when cross-compiling (it only builds
+# the library for the host toolchain), so name the library itself, as
+# Google's embedder-archive target does.
+ninja -C "out/$target" \
+    flutter/shell/platform/embedder:flutter_engine_library \
+    flutter/shell/platform/embedder:copy_headers \
+    clang_x64/gen_snapshot
 
 o=out/$target
 # tools/gn turns on the embedder's Vulkan renderer (kVulkan) for Linux; the
