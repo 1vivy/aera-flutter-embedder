@@ -1,0 +1,31 @@
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1718,6 +1718,12 @@ zink_get_display_device(const struct zink_screen *screen, uint32_t pdev_count,
+          return i;
+    }
+ 
++   /* Android's KGSL Vulkan path has no DRM render node to match. For the
++    * surfaceless AERA runtime there is exactly one physical device, so it is
++    * unambiguous and safe to select it directly. */
++   if (pdev_count == 1)
++      return 0;
++
+    return -1;
+ }
+
+--- a/src/egl/drivers/dri2/platform_surfaceless.c
++++ b/src/egl/drivers/dri2/platform_surfaceless.c
+@@ -389,8 +389,11 @@ dri2_initialize_surfaceless(_EGLDisplay *disp)
+    driver_loaded = surfaceless_probe_device(disp, disp->Options.ForceSoftware,
+                                             disp->Options.Zink);
+-   if (!driver_loaded && disp->Options.ForceSoftware) {
+-      _eglLog(_EGL_DEBUG, "Falling back to surfaceless swrast without DRM.");
++   if (!driver_loaded &&
++       (disp->Options.ForceSoftware || disp->Options.Zink)) {
++      _eglLog(_EGL_DEBUG,
++              "Falling back to surfaceless %s without DRM.",
++              disp->Options.Zink ? "zink" : "swrast");
+       driver_loaded = surfaceless_probe_device_sw(disp);
+    }
+ 
+    if (!driver_loaded) {
