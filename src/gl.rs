@@ -83,7 +83,6 @@ pub struct Gpu {
     gles: Gles,
     display: EGLDisplay,
     render: EGLContext,
-    resource: EGLContext,
     width: i32,
     height: i32,
     /// Framebuffer object, created on the raster thread on first use.
@@ -137,8 +136,7 @@ impl Gpu {
             }
             let context_attributes = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
             let render = (egl.create_context)(display, config, std::ptr::null_mut(), context_attributes.as_ptr());
-            let resource = (egl.create_context)(display, config, render, context_attributes.as_ptr());
-            if render.is_null() || resource.is_null() {
+            if render.is_null() {
                 return Err(format!("eglCreateContext failed ({:#x})", (egl.get_error)()));
             }
             let proc = |name: &str| -> Result<*mut c_void, String> {
@@ -170,7 +168,6 @@ impl Gpu {
                 gles,
                 display,
                 render,
-                resource,
                 width,
                 height,
                 fbo: std::sync::atomic::AtomicU32::new(0),
@@ -180,10 +177,6 @@ impl Gpu {
 
     pub fn make_render_current(&self) -> bool {
         unsafe { (self.egl.make_current)(self.display, std::ptr::null_mut(), std::ptr::null_mut(), self.render) != 0 }
-    }
-
-    pub fn make_resource_current(&self) -> bool {
-        unsafe { (self.egl.make_current)(self.display, std::ptr::null_mut(), std::ptr::null_mut(), self.resource) != 0 }
     }
 
     pub fn clear_current(&self) -> bool {
