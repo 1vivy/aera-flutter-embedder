@@ -10,3 +10,4 @@ pub mod engine;
 mod ffi;
 pub mod gl;
 pub mod text_input;
+pub mod vk;

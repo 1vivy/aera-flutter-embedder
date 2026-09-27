@@ -39,6 +39,23 @@ Mesa 26.2.2 is built for arm64 with `-Dgallium-drivers=zink,softpipe
 -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm,kgsl -Dplatforms=` and AERA
 Browser's `mesa-26.2.2-zink-kgsl-surfaceless.patch`.
 
+## Renderers
+
+GL (Skia on EGL, through Zink on the phone) is the default. An app can pick
+another by shipping `usr/share/flutter/renderer` containing one word, or the
+worker reads `AERA_FLUTTER_RENDERER`:
+
+- `gl`: Skia on OpenGL ES.
+- `vulkan`: Skia on Vulkan, straight on Turnip without Zink.
+- `impeller`: Impeller on Vulkan.
+
+On Vulkan, Flutter draws into two device-local images and the worker copies
+each finished frame into the slot with one GPU copy. Impeller's Linux build
+insists on a window-system surface extension, so the worker names
+`VK_KHR_surface`, `VK_KHR_wayland_surface` and `VK_KHR_swapchain` to Flutter
+without enabling them; no swapchain is ever made. Damage-only copies are GL
+only for now.
+
 ## Limits
 
 - The runtime kit carries Google's debug (JIT) embedder build, so apps are
