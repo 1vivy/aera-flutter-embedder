@@ -31,7 +31,7 @@ fn main() {
     let root = PathBuf::from(std::env::var_os("AERA_FLUTTER_ROOT").unwrap_or_else(|| "/".into()));
     let mut config = engine::default_config(&root);
     if let Some(args) = std::env::var_os("AERA_FLUTTER_ENGINE_ARGS") {
-        config.extra_engine_args = args.to_string_lossy().split_whitespace().map(str::to_owned).collect();
+        config.extra_engine_args.extend(args.to_string_lossy().split_whitespace().map(str::to_owned));
     }
 
     // A second handle on the control socket, so a startup failure can still

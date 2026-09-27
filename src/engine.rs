@@ -486,6 +486,8 @@ pub fn default_config(root: &Path) -> Config {
         icu_data: share.join("icudtl.dat"),
         aot_library: root.join("usr/lib/libapp.so"),
         locale: std::env::var("AERA_LOCALE").unwrap_or_else(|_| "en".into()),
-        extra_engine_args: Vec::new(),
+        // AERA's jail seccomp policy denies listen(), so the Dart VM
+        // service could never accept connections there anyway.
+        extra_engine_args: vec!["--disable-vm-service".into()],
     }
 }
