@@ -24,6 +24,8 @@ downloads the kits built here.
 | `tools/assemble_runtime.py` | builds the arm64 runtime: glibc, Flutter engine, Mesa, fonts and the embedder, as real files resolved by soname |
 | `tools/make_aerap.py` | packs a staged payload into an installable `.aerap` (`browser` ID, `browser-runtime` type) |
 | `tools/package_kits.sh` | makes the runtime and simulator kits published as releases (`flutter-<version>` tags) |
+| `tools/build_engine.sh` | builds the arm64 release or profile embedder engine and its x64-hosted `gen_snapshot` from Flutter's source (run by the Engine workflow) |
+| `tools/build_aot_app.sh` | compiles an app into an arm64 `libapp.so` for one of those engines |
 
 ## Build
 
@@ -39,9 +41,10 @@ Browser's `mesa-26.2.2-zink-kgsl-surfaceless.patch`.
 
 ## Limits
 
-- The engine is Google's debug (JIT) embedder build, so apps are debug builds
-  and must use exactly the Flutter release named in the kit. Release (AOT)
-  needs a custom engine build.
+- The runtime kit carries Google's debug (JIT) embedder build, so apps are
+  debug builds and must use exactly the Flutter release named in the kit.
+  Release and profile (AOT) engines are built from source by the Engine
+  workflow; the embedder loads `usr/lib/libapp.so` when the engine is AOT.
 - Installing replaces AERA Browser on that phone until the browser is
   reinstalled, and AERA's browser top bar stays above the app.
 - The jail denies `listen()`, so the Dart VM service is off.

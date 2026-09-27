@@ -1,0 +1,84 @@
+name: Engine
+# Builds the arm64 release and profile embedder engines from source (see
+# tools/build_engine.sh), checks that an app compiles against each, and
+# optionally attaches them to the flutter-<version> release the template
+# downloads its kits from.
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: Flutter release to build the engine for
+        default: 3.47.5
+      publish:
+        description: Attach the engines to the flutter-<version> release
+        type: boolean
+        default: false
+  # A pull request that changes the build runs it once, so the engine build
+  # is proven before it lands (workflow_dispatch only sees the default branch).
+  pull_request:
+    paths:
+      - tools/build_engine.sh
+      - tools/build_aot_app.sh
+      - .github/workflows/engine.yml
+
+env:
+  FLUTTER_VERSION: ${{ inputs.flutter_version || '3.47.5' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [release, profile]
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/.ghcup /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: actions/checkout@v4
+      - name: Build engine
+        run: tools/build_engine.sh "$FLUTTER_VERSION" "${{ matrix.mode }}" dist
+        env:
+          ENGINE_WORK_DIR: ${{ runner.temp }}/engine
+      - name: Compile an app against it
+        run: |
+          set -euo pipefail
+          v="$FLUTTER_VERSION"
+          curl -fsSL "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_$v-stable.tar.xz" \
+            | tar -C "$RUNNER_TEMP" -xJ
+          export PATH=$RUNNER_TEMP/flutter/bin:$PATH
+          flutter --disable-analytics >/dev/null
+          kit=$RUNNER_TEMP/kit && mkdir -p "$kit"
+          tar -C "$kit" -xJf "dist/aera-flutter-engine-arm64-${{ matrix.mode }}-$v.tar.xz"
+          file "$kit/usr/lib/libflutter_engine.so" "$kit/host/linux-x64/gen_snapshot"
+          "$kit/host/linux-x64/gen_snapshot" --version
+          flutter create --no-pub "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke" && flutter pub get
+          "$GITHUB_WORKSPACE/tools/build_aot_app.sh" "${{ matrix.mode }}" "$kit" out
+          file out/libapp.so | tee /dev/stderr | grep -q 'ARM aarch64'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.mode }}
+          path: dist/
+          compression-level: 0
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: flutter-${{ env.FLUTTER_VERSION }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*.tar.xz
