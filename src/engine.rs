@@ -406,8 +406,13 @@ unsafe extern "C" fn clear_current(user_data: *mut c_void) -> bool {
     shared(user_data).gpu.clear_current()
 }
 
-unsafe extern "C" fn make_resource_current(user_data: *mut c_void) -> bool {
-    shared(user_data).gpu.make_resource_current()
+/// There is no resource context: Flutter then uploads images on the raster
+/// thread with the render context. A second EGL context sharing the render
+/// context leaked every texture uploaded through it (tens of MB a second in an
+/// app decoding one 360x700 image per frame, under both softpipe and
+/// llvmpipe), which AERA's 1.5 GiB memory limit turns into a crash.
+unsafe extern "C" fn make_resource_current(_user_data: *mut c_void) -> bool {
+    false
 }
 
 unsafe extern "C" fn fbo_callback(user_data: *mut c_void) -> u32 {
