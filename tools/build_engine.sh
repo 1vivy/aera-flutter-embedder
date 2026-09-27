@@ -29,7 +29,9 @@ work=$(realpath -m "${ENGINE_WORK_DIR:-.engine-build}")
 mkdir -p "$work" "$out"
 cd "$work"
 
-[ -d depot_tools ] || git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+# Not shallow: git 2.55 fails shallow clones of googlesource repos with
+# "update_ref failed ... nonexistent object".
+[ -d depot_tools ] || git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
 export PATH=$work/depot_tools:$PATH
 
 # The engine lives in the flutter/flutter monorepo; the release tag pins the
@@ -57,7 +59,12 @@ solutions = [{
   },
 }]
 EOF
-gclient sync --no-history --shallow -D
+# Shallow deps save ~10 GB; fall back to full history if this git trips over
+# shallow fetches the way it does on the depot_tools clone.
+gclient sync --no-history --shallow -D || {
+    echo "Shallow sync failed; retrying with history" >&2
+    gclient sync -D
+}
 
 cd engine/src
 target=aera_${mode}_arm64
