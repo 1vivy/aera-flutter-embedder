@@ -40,6 +40,8 @@ struct Options {
     /// Save the newest frame at these times (ms after the first frame).
     save: Vec<u64>,
     script: Vec<(u64, Input)>,
+    /// Hold each ACK this long, like AERA waiting for its display refresh.
+    ack_delay: Duration,
 }
 
 fn parse() -> Result<Options, String> {
@@ -51,6 +53,7 @@ fn parse() -> Result<Options, String> {
         timeout: Duration::from_secs(60),
         save: Vec::new(),
         script: Vec::new(),
+        ack_delay: Duration::ZERO,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -65,6 +68,7 @@ fn parse() -> Result<Options, String> {
             "--out" => options.out = value()?.into(),
             "--until" => options.until = value()?.parse().map_err(|_| "bad --until")?,
             "--timeout" => options.timeout = Duration::from_secs(value()?.parse().map_err(|_| "bad --timeout")?),
+            "--ack-delay" => options.ack_delay = Duration::from_millis(value()?.parse().map_err(|_| "bad --ack-delay")?),
             "--save-at" => options.save.push(value()?.parse().map_err(|_| "bad --save-at")?),
             "--tap" => {
                 let (point, frame) = at(&value()?)?;
@@ -225,6 +229,7 @@ fn main() {
                     first = Some(Instant::now());
                     println!("first frame after {:.2}s", started.elapsed().as_secs_f64());
                 }
+                std::thread::sleep(options.ack_delay);
                 let mut ack = Packet::new(kind::ACK);
                 ack.sequence = last;
                 host.send(&ack).expect("ack");

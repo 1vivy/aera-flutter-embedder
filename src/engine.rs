@@ -85,18 +85,26 @@ struct Shared {
     stats: Option<Mutex<FrameStats>>,
 }
 
-/// Per-frame costs, printed every 120 frames when AERA_FLUTTER_STATS is set.
+/// Per-frame costs over 120 frames, written to STATS_FILE and also printed
+/// when AERA_FLUTTER_STATS is set.
 #[derive(Default)]
 struct FrameStats {
     frames: u32,
+    started: Option<std::time::Instant>,
     ack_wait: Duration,
     readback: Duration,
     convert: Duration,
     area: f64,
+    print: bool,
 }
+
+/// Where the latest per-frame timings are written, once every 120 frames,
+/// so an app can show them on the phone (the demo's Motion page does).
+pub const STATS_FILE: &str = "/tmp/aera-flutter-stats";
 
 impl FrameStats {
     fn add(&mut self, ack_wait: Duration, readback: Duration, convert: Duration, area: f64) {
+        let started = *self.started.get_or_insert_with(std::time::Instant::now);
         self.frames += 1;
         self.area += area;
         self.ack_wait += ack_wait;
@@ -104,11 +112,19 @@ impl FrameStats {
         self.convert += convert;
         if self.frames == 120 {
             let ms = |d: Duration| d.as_secs_f64() * 1000.0 / 120.0;
-            eprintln!(
-                "aera-flutter: per frame over 120: ack wait {:.2} ms, readback {:.2} ms, swizzle {:.2} ms, copied {:.0}% of the frame",
+            let fps = 119.0 / started.elapsed().as_secs_f64().max(1e-3);
+            let line = format!(
+                "frames sent {fps:.0}/s, waiting for AERA {:.1} ms, readback {:.1} ms, swizzle {:.1} ms, copied {:.0}%",
                 ms(self.ack_wait), ms(self.readback), ms(self.convert), self.area * 100.0 / 120.0
             );
-            *self = FrameStats::default();
+            if self.print {
+                eprintln!("aera-flutter: per frame over 120: {line}");
+            }
+            let temporary = format!("{STATS_FILE}.new");
+            if std::fs::write(&temporary, format!("{line}\n")).is_ok() {
+                let _ = std::fs::rename(&temporary, STATS_FILE);
+            }
+            *self = FrameStats { print: self.print, ..FrameStats::default() };
         }
     }
 }
@@ -148,7 +164,7 @@ impl Embedder {
             control,
             frame_state: Mutex::new(FrameState { sequence: 0, pending: false, vsync_baton: None, last_vsync: 0, last_damage: None }),
             frame_acked: Condvar::new(),
-            stats: std::env::var_os("AERA_FLUTTER_STATS").map(|_| Mutex::new(FrameStats::default())),
+            stats: Some(Mutex::new(FrameStats { print: std::env::var_os("AERA_FLUTTER_STATS").is_some(), ..FrameStats::default() })),
             closed: AtomicBool::new(false),
             platform_thread: std::thread::current().id(),
             tasks: Mutex::new((BinaryHeap::new(), 0)),
@@ -389,16 +405,15 @@ impl Embedder {
         code
     }
 
-    /// Answers Flutter's pending vsync request when AERA holds no unacknowledged
-    /// frame and a frame period has passed. Returns how long the platform loop
+    /// Answers Flutter's pending vsync request once a frame period has passed.
+    /// It does not wait for AERA to acknowledge the last frame, so Flutter
+    /// builds the next frame while AERA shows this one; `present` waits for
+    /// the acknowledgement before touching the shared slots. Returns how long the platform loop
     /// may sleep before checking again, or -1 when nothing is waiting.
     fn answer_vsync(&self, now: u64) -> i32 {
         let shared = &*self.shared;
         let mut state = shared.frame_state.lock().unwrap();
         let Some(baton) = state.vsync_baton else { return -1 };
-        if state.pending {
-            return -1; // the ACK handler wakes the loop
-        }
         let earliest = state.last_vsync + FRAME_PERIOD_NS;
         if now < earliest {
             return ((earliest - now) / 1_000_000).max(1) as i32;
