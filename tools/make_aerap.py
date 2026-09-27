@@ -11,8 +11,6 @@ Browser instead of replacing it.
     tools/make_aerap.py --stage build/stage --id org.example.app --name "My App" \\
         --version 0.1.0 --description "What it does" --out build/My-App-0.1.0.aerap
 
-Add --privileged to ask for the opt-in privileged mode (see PRIVILEGED).
-
 The payload format (AERAWEB1 + xz with the ARM64 filter) and limits follow
 aeraui/features/browser/runtime.cpp, and the manifest checks follow
 aeraui/features/plugins/plugin_manager.cpp, in
@@ -42,9 +40,6 @@ PROTOCOL_VERSION = 3
 # names for what the pixel host will grant.
 PERMISSIONS = ["display", "touch-input", "pixel-surface", "gpu-acceleration",
                "audio-output", "network"]
-# ASSUMED: opting in to the privileged mode (root, recovery's filesystem and
-# devices, like Host API 2 plugins today) is one more permission.
-PRIVILEGED = "privileged"
 
 MAX_MEMBERS = 4096
 MAX_MEMBER_BYTES = 100 * 1024 * 1024
@@ -146,8 +141,6 @@ def main():
     parser.add_argument("--description", default="A Flutter app for AERA Recovery.")
     parser.add_argument("--payload-url", default="https://example.invalid/runtime.xz",
                         help="where runtime.xz is published; unused for local installs")
-    parser.add_argument("--privileged", action="store_true",
-                        help="ask for the opt-in privileged mode")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
@@ -183,7 +176,7 @@ def main():
             "payload": "runtime.xz",
             "payload_url": args.payload_url,
             **sizes,
-            "permissions": PERMISSIONS + ([PRIVILEGED] if args.privileged else []),
+            "permissions": PERMISSIONS,
         }
         manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
         temporary = args.out.with_suffix(args.out.suffix + ".new")

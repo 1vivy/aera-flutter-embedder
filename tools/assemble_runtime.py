@@ -2,8 +2,8 @@
 """Assemble the AERA Flutter runtime: everything a Flutter app needs inside
 AERA's generic pixel + GPU plugin host except the app itself.
 
-The payload is a complete userspace, so it works whether or not AERA chroots
-into it: the glibc loader and libraries, the Flutter engine, Mesa (EGL, GLES,
+The payload is a complete userspace that runs from wherever AERA extracts it
+(generic plugins run in recovery's own filesystem, not a chroot): the glibc loader and libraries, the Flutter engine, Mesa (EGL, GLES,
 Zink, Turnip KGSL), the Vulkan loader, fonts, the static launcher at
 /usr/bin/aera-plugin (what AERA starts) and the embedder at
 /usr/bin/aera-flutter. Shared libraries are copied as real files under
@@ -90,7 +90,7 @@ def main():
             shutil.copy2(entry, usr_lib / entry.name)
     # aera-plugin points VK_DRIVER_FILES here. The driver path is made
     # relative to the JSON file so it resolves wherever AERA extracts the
-    # payload, chroot or not.
+    # payload.
     icds = list((args.mesa / "usr/share/vulkan/icd.d").glob("freedreno_icd*.json"))
     icd = json.loads(icds[0].read_text())
     icd["ICD"]["library_path"] = "../../../lib/libvulkan_freedreno.so"

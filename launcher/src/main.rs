@@ -2,14 +2,18 @@
 //!
 //! Host API 2 execs `usr/bin/aera-plugin` directly and, if that fails, only
 //! knows how to fall back to a packaged musl loader. The Flutter runtime is
-//! glibc, and when AERA does not chroot into the payload its
-//! `/lib/ld-linux-aarch64.so.1` is not where the kernel looks. So this tiny
+//! glibc, and generic plugins run in recovery's own filesystem, where the
+//! payload's `/lib/ld-linux-aarch64.so.1` is not where the kernel looks. So this tiny
 //! static program is what AERA starts: it finds the runtime around itself,
 //! points Mesa and the Vulkan loader into it, and execs `usr/bin/aera-flutter`
 //! through the runtime's own loader. Descriptors (the control channel and
 //! the pixel surface) and arguments pass through untouched.
 //!
-//! Build it static so it runs with or without a chroot:
+//! Flutter's engine only reads fonts from `/usr/share/fonts/`. Plugins run
+//! as root, so the launcher gives itself a private mount namespace and binds
+//! the payload's fonts there; recovery's own mounts are not changed.
+//!
+//! Build it static so the kernel needs no loader to start it:
 //! `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p aera-plugin --target <triple>`
 
 use std::ffi::{CString, OsStr, OsString};
@@ -37,8 +41,38 @@ fn cstring(value: &OsStr) -> CString {
     CString::new(value.as_bytes()).expect("argument with NUL")
 }
 
+/// Makes `/usr/share/fonts` show the payload's fonts, in a mount namespace
+/// only this plugin (and its children) see. Best effort: text is missing,
+/// not the app, when it fails.
+fn bind_fonts(root: &Path) {
+    let fonts = root.join("usr/share/fonts");
+    let target = Path::new("/usr/share/fonts");
+    if !fonts.is_dir() || root == Path::new("/") || unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let path = |p: &Path| cstring(p.as_os_str());
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNS) != 0
+            || libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) != 0
+        {
+            eprintln!("aera-plugin: no private mount namespace for fonts: {}", std::io::Error::last_os_error());
+            return;
+        }
+    }
+    // Recovery's rootfs is a ramdisk, so a created mount point is gone at
+    // the next boot.
+    if std::fs::create_dir_all(target).is_err() {
+        return;
+    }
+    let (source, target) = (path(&fonts), path(target));
+    if unsafe { libc::mount(source.as_ptr(), target.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } != 0 {
+        eprintln!("aera-plugin: could not bind fonts: {}", std::io::Error::last_os_error());
+    }
+}
+
 fn main() {
     let root = runtime_root();
+    bind_fonts(&root);
     set_default("AERA_PLUGIN_ROOT", &root);
     let icd = root.join("usr/share/vulkan/icd.d/freedreno_icd.json");
     if icd.is_file() {

@@ -31,8 +31,9 @@
 //! | Frames | worker sends `PRESENT` for slot `sequence % slots`, host answers `FRAME_DONE` |
 //! | Input | `TOUCH_DOWN/MOVE/UP` in surface pixels, `KEY` code points, `BACK` |
 //! | Lifecycle | Host API 2's `LIFECYCLE` resume, pause, stop |
-//! | Filesystem | payload extracted like Host API 2 (`AERA_PLUGIN_ROOT`); a chroot into it, as the browser jail does, is hoped for but not required except for fonts |
-//! | GPU | `/dev/kgsl-3d0` and the DMA heap reachable, as in the browser jail |
+//! | Process | root in recovery's own namespaces, no jail, like every Host API 2 plugin (plugins are recovery modules) |
+//! | Filesystem | payload extracted like Host API 2, named in `AERA_PLUGIN_ROOT`; recovery's `/` stays `/` |
+//! | GPU | `/dev/kgsl-3d0` and the DMA heap, which root already reaches; the host only has to leave the GPU free while the plugin is in front |
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

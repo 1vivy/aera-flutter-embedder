@@ -22,9 +22,9 @@ browser chrome over it.
    --aera-host-api=3` with its control channel on fd 4 and, assumed, a pixel
    surface memfd on fd 3.
 2. `aera-plugin` is a small static program. It finds the runtime around
-   itself, points Mesa and the Vulkan loader into it, and execs
-   `usr/bin/aera-flutter` through the runtime's own glibc loader, so the app
-   works whether or not AERA chroots into the payload.
+   itself, binds the payload's fonts at `/usr/share/fonts` in a private mount
+   namespace, points Mesa and the Vulkan loader into the payload, and execs
+   `usr/bin/aera-flutter` through the runtime's own glibc loader.
 3. `aera-flutter` handshakes (`HELLO` → `HELLO_ACK` with the pixel surface
    feature → `SURFACE` with width, height, stride, slots and scale), renders
    with Flutter's OpenGL backend on surfaceless EGL (Mesa Zink → Turnip →
@@ -32,9 +32,9 @@ browser chrome over it.
    AERA answers `FRAME_DONE`. Touches, keys, Back and lifecycle arrive on the
    channel.
 
-Host API 2 plugins run as root with recovery's full access. The template asks
-for that only through an opt-in `privileged` flag, assuming the pixel host
-will offer a jailed default and a privileged mode.
+Like every generic plugin, the app is a recovery module: it runs as root in
+recovery's own namespaces with recovery's full access. There is no jail; the
+browser jail stays AERA Browser's alone.
 
 ## Pieces
 
@@ -75,5 +75,5 @@ Browser's `mesa-26.2.2-zink-kgsl-surfaceless.patch`.
 
 - The engine is Google's debug (JIT) embedder build, so apps are debug builds
   and must use exactly the Flutter release named in the kit.
-- The Flutter engine only looks for fonts in `/usr/share/fonts`, so unless the
-  host chroots into the payload, apps need to bundle their fonts as assets.
+- The Flutter engine only looks for fonts in `/usr/share/fonts`; `aera-plugin`
+  binds the payload's fonts there in its own mount namespace.
