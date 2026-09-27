@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::bridge::{self, kind, Control, Frames, Packet};
 use crate::ffi::*;
-use crate::gl::Gpu;
+use crate::gl::{Gpu, Region};
 use crate::text_input::{Effect, TextInput};
 
 pub struct Config {
@@ -36,6 +36,10 @@ struct FrameState {
     /// previous frame and a frame period has passed since the last vsync.
     vsync_baton: Option<isize>,
     last_vsync: u64,
+    /// What the previous frame changed. The slot the next frame goes into
+    /// still holds the frame before that, so both frames' changes must be
+    /// copied; None means copy everything.
+    last_damage: Option<Region>,
 }
 
 /// AERA does not report its display rate; pace at 60 Hz at most.
@@ -72,19 +76,21 @@ struct FrameStats {
     ack_wait: Duration,
     readback: Duration,
     convert: Duration,
+    area: f64,
 }
 
 impl FrameStats {
-    fn add(&mut self, ack_wait: Duration, readback: Duration, convert: Duration) {
+    fn add(&mut self, ack_wait: Duration, readback: Duration, convert: Duration, area: f64) {
         self.frames += 1;
+        self.area += area;
         self.ack_wait += ack_wait;
         self.readback += readback;
         self.convert += convert;
         if self.frames == 120 {
             let ms = |d: Duration| d.as_secs_f64() * 1000.0 / 120.0;
             eprintln!(
-                "aera-flutter: per frame over 120: ack wait {:.2} ms, readback {:.2} ms, swizzle {:.2} ms",
-                ms(self.ack_wait), ms(self.readback), ms(self.convert)
+                "aera-flutter: per frame over 120: ack wait {:.2} ms, readback {:.2} ms, swizzle {:.2} ms, copied {:.0}% of the frame",
+                ms(self.ack_wait), ms(self.readback), ms(self.convert), self.area * 100.0 / 120.0
             );
             *self = FrameStats::default();
         }
@@ -121,7 +127,7 @@ impl Embedder {
             gpu,
             frames,
             control,
-            frame_state: Mutex::new(FrameState { sequence: 0, pending: false, vsync_baton: None, last_vsync: 0 }),
+            frame_state: Mutex::new(FrameState { sequence: 0, pending: false, vsync_baton: None, last_vsync: 0, last_damage: None }),
             frame_acked: Condvar::new(),
             stats: std::env::var_os("AERA_FLUTTER_STATS").map(|_| Mutex::new(FrameStats::default())),
             closed: AtomicBool::new(false),
@@ -154,8 +160,9 @@ impl Embedder {
             gl.struct_size = std::mem::size_of::<FlutterOpenGLRendererConfig>();
             gl.make_current = Some(make_current);
             gl.clear_current = Some(clear_current);
-            gl.present = Some(present);
-            gl.fbo_callback = Some(fbo_callback);
+            gl.present_with_info = Some(present);
+            gl.fbo_with_frame_info_callback = Some(fbo_callback);
+            gl.populate_existing_damage = Some(existing_damage);
             gl.make_resource_current = Some(make_resource_current);
             gl.gl_proc_resolver = Some(proc_resolver);
             gl.surface_transformation = Some(flip_vertically);
@@ -496,7 +503,7 @@ unsafe extern "C" fn request_vsync(user_data: *mut c_void, baton: isize) {
     s.wake();
 }
 
-unsafe extern "C" fn fbo_callback(user_data: *mut c_void) -> u32 {
+unsafe extern "C" fn fbo_callback(user_data: *mut c_void, _info: *const FlutterFrameInfo) -> u32 {
     shared(user_data).gpu.framebuffer()
 }
 
@@ -504,10 +511,37 @@ unsafe extern "C" fn proc_resolver(user_data: *mut c_void, name: *const c_char) 
     shared(user_data).gpu.proc_address(CStr::from_ptr(name))
 }
 
-/// Raster thread: copy the finished frame into the free slot and hand it to
-/// AERA, waiting first for AERA to release the previous one.
-unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
+/// Our framebuffer keeps the previous frame, so nothing needs repainting
+/// beyond what Flutter itself marks as changed.
+unsafe extern "C" fn existing_damage(_user_data: *mut c_void, _fbo: isize, damage: *mut FlutterDamage) {
+    // The engine only turns on partial repaint when this holds at least one
+    // rectangle, so report an empty one.
+    static mut NOTHING: FlutterRect = FlutterRect { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+    let damage = &mut *damage;
+    damage.num_rects = 1;
+    damage.damage = std::ptr::addr_of_mut!(NOTHING);
+}
+
+/// Bounding box of Flutter's damage rectangles, or None for the whole frame.
+fn damage_bounds(damage: &FlutterDamage) -> Option<Region> {
+    if damage.num_rects == 0 || damage.damage.is_null() {
+        return None;
+    }
+    let rects = unsafe { std::slice::from_raw_parts(damage.damage, damage.num_rects) };
+    rects.iter().fold(Some(Region::default()), |bounds, r| {
+        let x = r.left.floor() as i32;
+        let y = r.top.floor() as i32;
+        let rect = Region { x, y, width: r.right.ceil() as i32 - x, height: r.bottom.ceil() as i32 - y };
+        bounds.map(|b| b.union(rect))
+    })
+}
+
+/// Raster thread: copy the changed part of the finished frame into the free
+/// slot and hand it to AERA, waiting first for AERA to release the previous
+/// one.
+unsafe extern "C" fn present(user_data: *mut c_void, info: *const FlutterPresentInfo) -> bool {
     let s = shared(user_data);
+    let damage = if std::env::var_os("AERA_FLUTTER_FULL_FRAMES").is_some() { None } else { damage_bounds(&(*info).frame_damage) };
     let waited = std::time::Instant::now();
     let mut state = s.frame_state.lock().unwrap();
     while state.pending && !s.closed.load(Ordering::Acquire) {
@@ -518,9 +552,15 @@ unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
     }
     let ack_wait = waited.elapsed();
     let next = state.sequence.wrapping_add(1);
-    let (readback, convert) = s.gpu.read_frame(s.frames.slot(next));
+    let region = match (damage, state.last_damage) {
+        (Some(now), Some(before)) => Some(now.union(before)),
+        _ => None,
+    };
+    state.last_damage = damage;
+    let (readback, convert) = s.gpu.read_frame(s.frames.slot(next), region);
     if let Some(stats) = &s.stats {
-        stats.lock().unwrap().add(ack_wait, readback, convert);
+        let area = region.map_or(1.0, |r| r.area() as f64 / (bridge::WIDTH as f64 * bridge::HEIGHT as f64));
+        stats.lock().unwrap().add(ack_wait, readback, convert, area);
     }
     let mut packet = Packet::new(kind::FRAME);
     packet.sequence = next;

@@ -46,6 +46,7 @@ const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
 const GL_RGBA: GLenum = 0x1908;
 const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 const GL_PACK_ALIGNMENT: GLenum = 0x0D05;
+const GL_PACK_ROW_LENGTH: GLenum = 0x0D02;
 const GL_RENDERER: GLenum = 0x1F01;
 const GL_EXTENSIONS: GLenum = 0x1F03;
 const GL_BGRA_EXT: GLenum = 0x80E1;
@@ -80,6 +81,42 @@ struct Gles {
 
 /// An EGL display with two contexts: one Flutter renders with on the raster
 /// thread and one sharing its objects for texture uploads on the IO thread.
+/// A rectangle of the frame in top-down pixel rows, which (because Flutter
+/// draws flipped) are also the framebuffer's GL rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Region {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Region {
+    pub fn union(self, other: Region) -> Region {
+        if self.width <= 0 || self.height <= 0 {
+            return other;
+        }
+        if other.width <= 0 || other.height <= 0 {
+            return self;
+        }
+        let (x, y) = (self.x.min(other.x), self.y.min(other.y));
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Region { x, y, width: right - x, height: bottom - y }
+    }
+
+    fn clamp(self, width: i32, height: i32) -> Region {
+        let (x, y) = (self.x.clamp(0, width), self.y.clamp(0, height));
+        let right = (self.x + self.width).clamp(x, width);
+        let bottom = (self.y + self.height).clamp(y, height);
+        Region { x, y, width: right - x, height: bottom - y }
+    }
+
+    pub fn area(self) -> u64 {
+        self.width.max(0) as u64 * self.height.max(0) as u64
+    }
+}
+
 pub struct Gpu {
     _library: Library,
     egl: Egl,
@@ -238,11 +275,19 @@ impl Gpu {
     /// `engine::flip_vertically`), so GL's bottom-up rows come out top-down.
     /// Where the driver offers GL_EXT_read_format_bgra the GPU also does the
     /// swizzle; otherwise R and B are swapped in place.
+    /// Only `region` is read when given; the rest of `out` is left as is.
     /// Returns how long the GPU readback and the CPU swizzle took.
-    pub fn read_frame(&self, out: &mut [u8]) -> (std::time::Duration, std::time::Duration) {
+    pub fn read_frame(&self, out: &mut [u8], region: Option<Region>) -> (std::time::Duration, std::time::Duration) {
         use std::sync::atomic::Ordering;
-        let bytes = self.width as usize * self.height as usize * 4;
-        assert!(out.len() >= bytes);
+        let full = Region { x: 0, y: 0, width: self.width, height: self.height };
+        let r = region.unwrap_or(full).clamp(self.width, self.height);
+        let row = self.width as usize * 4;
+        assert!(out.len() >= row * self.height as usize);
+        if r.width == 0 || r.height == 0 {
+            return Default::default();
+        }
+        let first = r.y as usize * row + r.x as usize * 4;
+        let target = out[first..].as_mut_ptr().cast();
         let start = std::time::Instant::now();
         let mut bgra = match self.bgra_readback.load(Ordering::Relaxed) {
             0 => {
@@ -256,9 +301,10 @@ impl Gpu {
             let g = &self.gles;
             (g.bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer());
             (g.pixel_storei)(GL_PACK_ALIGNMENT, 4);
+            (g.pixel_storei)(GL_PACK_ROW_LENGTH, self.width);
             while (g.get_error)() != 0 {}
             if bgra {
-                (g.read_pixels)(0, 0, self.width, self.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, out.as_mut_ptr().cast());
+                (g.read_pixels)(r.x, r.y, r.width, r.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, target);
                 if (g.get_error)() != 0 {
                     eprintln!("aera-flutter: BGRA readback refused, swizzling on the CPU");
                     self.bgra_readback.store(2, Ordering::Relaxed);
@@ -266,13 +312,15 @@ impl Gpu {
                 }
             }
             if !bgra {
-                (g.read_pixels)(0, 0, self.width, self.height, GL_RGBA, GL_UNSIGNED_BYTE, out.as_mut_ptr().cast());
+                (g.read_pixels)(r.x, r.y, r.width, r.height, GL_RGBA, GL_UNSIGNED_BYTE, target);
             }
         }
         let read = start.elapsed();
         if !bgra {
-            for pixel in out[..bytes].chunks_exact_mut(4) {
-                pixel.swap(0, 2);
+            for line in out[first..].chunks_mut(row).take(r.height as usize) {
+                for pixel in line[..r.width as usize * 4].chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
             }
         }
         (read, start.elapsed() - read)
