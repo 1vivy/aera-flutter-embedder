@@ -9,6 +9,7 @@
 //! ```text
 //! aera-host-sim --plugin payload/usr/bin/aera-plugin --root payload/ \
 //!     --out frames/ --until 3000 --tap 105,218@1000 --key h@2000 --save-at 2500
+//!     [--drag 100,300>200,400@1500] [--ack-delay 12] [--slots 2]
 //! ```
 //!
 //! Times are milliseconds after the first frame. Taps are in logical pixels
@@ -27,6 +28,8 @@ use aera_flutter_embedder::host::{self, kind, lifecycle, Control, Geometry, Mess
 
 enum Input {
     Tap(f64, f64),
+    /// Press at the first point, move to the second over ~300 ms, release.
+    Drag(f64, f64, f64, f64),
     Key(u32),
     Back,
     Pause,
@@ -44,6 +47,8 @@ struct Options {
     /// Save the newest frame at these times (ms after the first frame).
     save: Vec<u64>,
     script: Vec<(u64, Input)>,
+    /// Hold each FRAME_DONE this long, like AERA waiting for its display refresh.
+    ack_delay: Duration,
 }
 
 fn parse() -> Result<Options, String> {
@@ -56,6 +61,7 @@ fn parse() -> Result<Options, String> {
         timeout: Duration::from_secs(60),
         save: Vec::new(),
         script: Vec::new(),
+        ack_delay: Duration::ZERO,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -75,6 +81,17 @@ fn parse() -> Result<Options, String> {
                 options.geometry.width = w.parse().map_err(|_| "bad width")?;
                 options.geometry.height = h.parse().map_err(|_| "bad height")?;
                 options.geometry.stride = options.geometry.width * 4;
+            }
+            "--slots" => options.geometry.slots = value()?.parse().map_err(|_| "bad --slots")?,
+            "--ack-delay" => options.ack_delay = Duration::from_millis(value()?.parse().map_err(|_| "bad --ack-delay")?),
+            "--drag" => {
+                let (path, time) = at(&value()?)?;
+                let numbers: Vec<f64> = path
+                    .split([',', '>'])
+                    .map(|n| n.parse().map_err(|_| "drag needs X1,Y1>X2,Y2"))
+                    .collect::<Result<_, _>>()?;
+                let [x1, y1, x2, y2] = numbers[..] else { return Err("drag needs X1,Y1>X2,Y2".into()) };
+                options.script.push((time, Input::Drag(x1, y1, x2, y2)));
             }
             "--scale" => options.geometry.scale = value()?.parse().map_err(|_| "bad --scale")?,
             "--until" => options.until = ms(value()?)?,
@@ -217,6 +234,20 @@ fn main() {
                         std::thread::sleep(Duration::from_millis(60));
                         send(Message { value: x, flags: y, ..Message::new(kind::TOUCH_UP) });
                     }
+                    Input::Drag(x1, y1, x2, y2) => {
+                        let at = |x: f64, y: f64, kind: u32| Message {
+                            value: (x * geometry.scale) as u32,
+                            flags: (y * geometry.scale) as u32,
+                            ..Message::new(kind)
+                        };
+                        send(at(x1, y1, kind::TOUCH_DOWN));
+                        for step in 1..=10 {
+                            std::thread::sleep(Duration::from_millis(30));
+                            let t = step as f64 / 10.0;
+                            send(at(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, kind::TOUCH_MOVE));
+                        }
+                        send(at(x2, y2, kind::TOUCH_UP));
+                    }
                     Input::Key(code) => send(Message { value: code, ..Message::new(kind::KEY) }),
                     Input::Back => send(Message::new(kind::BACK)),
                     Input::Pause => send(Message { value: lifecycle::PAUSE, ..Message::new(kind::LIFECYCLE) }),
@@ -278,6 +309,7 @@ fn main() {
                     first = Some(Instant::now());
                     println!("first frame after {:.2}s", started.elapsed().as_secs_f64());
                 }
+                std::thread::sleep(options.ack_delay);
                 send(Message { request_id: last, ..Message::new(kind::FRAME_DONE) });
             }
             kind::KEYBOARD_SHOW => println!("keyboard shown (purpose {})", message.value),

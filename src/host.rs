@@ -196,8 +196,9 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// The browser host's screen, used by the simulator by default.
-    pub const PHONE: Geometry = Geometry { width: 1080, height: 2100, stride: 1080 * 4, slots: 2, scale: 3.0 };
+    /// The browser host's screen with the three slots asked of the pixel
+    /// host, used by the simulator by default.
+    pub const PHONE: Geometry = Geometry { width: 1080, height: 2100, stride: 1080 * 4, slots: 3, scale: 3.0 };
 
     pub fn frame_bytes(&self) -> usize {
         self.stride as usize * self.height as usize

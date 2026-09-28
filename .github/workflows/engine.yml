@@ -1,0 +1,116 @@
+name: Engine
+# Builds the arm64 release and profile embedder engines from source (see
+# tools/build_engine.sh), checks that an app compiles against each, and
+# optionally attaches them to the flutter-<version> release the template
+# downloads its kits from.
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: Flutter release to build the engine for
+        default: 3.47.5
+      publish:
+        description: Attach the engines to the flutter-<version> release
+        type: boolean
+        default: false
+  # A pull request that changes the build runs it once, so the engine build
+  # is proven before it lands (workflow_dispatch only sees the default branch).
+  pull_request:
+    paths:
+      - tools/build_engine.sh
+      - tools/build_aot_app.sh
+      - .github/workflows/engine.yml
+
+env:
+  FLUTTER_VERSION: ${{ inputs.flutter_version || '3.47.5' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [release, profile]
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/.ghcup /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: actions/checkout@v4
+      - name: Build engine
+        run: tools/build_engine.sh "$FLUTTER_VERSION" "${{ matrix.mode }}" dist
+        env:
+          ENGINE_WORK_DIR: ${{ runner.temp }}/engine
+      - name: Compile an app against it
+        run: |
+          set -euo pipefail
+          v="$FLUTTER_VERSION"
+          curl -fsSL "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_$v-stable.tar.xz" \
+            | tar -C "$RUNNER_TEMP" -xJ
+          export PATH=$RUNNER_TEMP/flutter/bin:$PATH
+          flutter --disable-analytics >/dev/null
+          kit=$RUNNER_TEMP/kit && mkdir -p "$kit"
+          tar -C "$kit" -xJf "dist/aera-flutter-engine-arm64-${{ matrix.mode }}-$v.tar.xz"
+          file "$kit/usr/lib/libflutter_engine.so" "$kit/host/linux-x64/gen_snapshot"
+          "$kit/host/linux-x64/gen_snapshot" --version
+          flutter create --no-pub "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke" && flutter pub get
+          "$GITHUB_WORKSPACE/tools/build_aot_app.sh" "${{ matrix.mode }}" "$kit" out
+          file out/libapp.so | tee /dev/stderr | grep -q 'ARM aarch64'
+      - name: Run the app on the engine under qemu
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static libclang-dev gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+          cargo build --release --bin aera-host-sim
+          cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --bin aera-browser-worker
+          # The published runtime kit supplies glibc and Mesa; swap in this
+          # engine, this worker and the AOT app.
+          root=$RUNNER_TEMP/root && mkdir -p "$root"
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/flutter-$FLUTTER_VERSION/aera-flutter-runtime-arm64-$FLUTTER_VERSION.tar.xz" \
+            | tar -C "$root" -xJ
+          cp "$RUNNER_TEMP/kit/usr/lib/libflutter_engine.so" "$RUNNER_TEMP/smoke/out/libapp.so" "$root/usr/lib/"
+          cp target/aarch64-unknown-linux-gnu/release/aera-browser-worker "$root/usr/bin/"
+          rm -rf "$root/usr/share/flutter/flutter_assets"
+          cp -r "$RUNNER_TEMP/smoke/out/flutter_assets" "$root/usr/share/flutter/"
+          readelf -d "$root/usr/lib/libflutter_engine.so" | grep NEEDED
+          for lib in $(readelf -d "$root/usr/lib/libflutter_engine.so" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+            [ -e "$root/lib/$lib" ] || [ -e "$root/usr/lib/$lib" ] || { echo "runtime kit lacks $lib" >&2; exit 1; }
+          done
+          QEMU_LD_PREFIX=$root GALLIUM_DRIVER=softpipe target/release/aera-host-sim \
+            --worker "$root/usr/bin/aera-browser-worker" --root "$root" \
+            --out frames --timeout 600 --until 3000 --save-at 2500
+          ls -l frames
+          # A blank 1080x2100 frame compresses to a few KB; the counter app does not.
+          [ "$(stat -c %s frames/at-02500ms.png)" -gt 20000 ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frames-${{ matrix.mode }}
+          path: frames/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.mode }}
+          path: dist/
+          compression-level: 0
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: flutter-${{ env.FLUTTER_VERSION }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*.tar.xz

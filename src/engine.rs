@@ -14,7 +14,8 @@ use serde_json::{json, Value};
 
 use crate::host::{self, kind, lifecycle, Control, Geometry, Message, Surface};
 use crate::ffi::*;
-use crate::gl::Gpu;
+use crate::gl::{Gpu, Region};
+use crate::vk::Vulkan;
 use crate::text_input::{Effect, TextInput};
 
 pub struct Config {
@@ -25,14 +26,41 @@ pub struct Config {
     pub aot_library: PathBuf,
     pub locale: String,
     pub extra_engine_args: Vec<String>,
+    pub renderer: Renderer,
+}
+
+/// How Flutter draws. `Gl` goes through Mesa's Zink to Vulkan; `Vulkan`
+/// hands Flutter a Vulkan device directly (Skia, or Impeller with the
+/// engine's `--enable-impeller` flag).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renderer {
+    Gl,
+    Vulkan,
+}
+
+enum Backend {
+    Gl(Gpu),
+    Vulkan(Vulkan),
 }
 
 struct FrameState {
-    /// Last sequence presented to AERA.
+    /// Last sequence sent to AERA.
     sequence: u32,
     /// A frame is out and AERA has not acknowledged it yet.
     pending: bool,
+    /// Flutter's request for the next vsync, answered once AERA has taken the
+    /// previous frame and a frame period has passed since the last vsync.
+    vsync_baton: Option<isize>,
+    last_vsync: u64,
+    /// What each of the last `slots - 1` frames changed, newest last. The
+    /// slot the next frame goes into still holds the frame `slots` back, so
+    /// all their changes must be copied too; a None, or too short a history,
+    /// means copy everything.
+    recent_damage: Vec<Option<Region>>,
 }
+
+/// AERA does not report its display rate; pace at 60 Hz at most.
+const FRAME_PERIOD_NS: u64 = 16_666_667;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Queued {
@@ -45,17 +73,61 @@ struct Queued {
 struct Shared {
     procs: FlutterEngineProcTable,
     engine: AtomicPtr<_FlutterEngine>,
-    gpu: Gpu,
+    gpu: Backend,
     surface: Surface,
     control: Control,
     frame_state: Mutex<FrameState>,
     frame_acked: Condvar,
-    scratch: Mutex<Vec<u8>>,
     closed: AtomicBool,
     platform_thread: ThreadId,
     tasks: Mutex<(BinaryHeap<Reverse<Queued>>, u64)>,
     wake: i32,
     text_input: Mutex<TextInput>,
+    stats: Option<Mutex<FrameStats>>,
+}
+
+/// Per-frame costs over 120 frames, written to STATS_FILE and also printed
+/// when AERA_FLUTTER_STATS is set.
+#[derive(Default)]
+struct FrameStats {
+    frames: u32,
+    started: Option<std::time::Instant>,
+    ack_wait: Duration,
+    readback: Duration,
+    convert: Duration,
+    area: f64,
+    print: bool,
+}
+
+/// Where the latest per-frame timings are written, once every 120 frames,
+/// so an app can show them on the phone (the demo's Motion page does).
+pub const STATS_FILE: &str = "/tmp/aera-flutter-stats";
+
+impl FrameStats {
+    fn add(&mut self, ack_wait: Duration, readback: Duration, convert: Duration, area: f64) {
+        let started = *self.started.get_or_insert_with(std::time::Instant::now);
+        self.frames += 1;
+        self.area += area;
+        self.ack_wait += ack_wait;
+        self.readback += readback;
+        self.convert += convert;
+        if self.frames == 120 {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0 / 120.0;
+            let fps = 119.0 / started.elapsed().as_secs_f64().max(1e-3);
+            let line = format!(
+                "frames sent {fps:.0}/s, waiting for AERA {:.1} ms, readback {:.1} ms, swizzle {:.1} ms, copied {:.0}%",
+                ms(self.ack_wait), ms(self.readback), ms(self.convert), self.area * 100.0 / 120.0
+            );
+            if self.print {
+                eprintln!("aera-flutter: per frame over 120: {line}");
+            }
+            let temporary = format!("{STATS_FILE}.new");
+            if std::fs::write(&temporary, format!("{line}\n")).is_ok() {
+                let _ = std::fs::rename(&temporary, STATS_FILE);
+            }
+            *self = FrameStats { print: self.print, ..FrameStats::default() };
+        }
+    }
 }
 
 pub struct Embedder {
@@ -79,7 +151,10 @@ impl Embedder {
                 return Err("FlutterEngineGetProcAddresses failed".into());
             }
         }
-        let gpu = Gpu::new(geometry.width as i32, geometry.height as i32)?;
+        let gpu = match config.renderer {
+            Renderer::Gl => Backend::Gl(Gpu::new(geometry.width as i32, geometry.height as i32)?),
+            Renderer::Vulkan => Backend::Vulkan(Vulkan::new(geometry.width, geometry.height)?),
+        };
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake < 0 {
             return Err("eventfd failed".into());
@@ -90,9 +165,9 @@ impl Embedder {
             gpu,
             surface,
             control,
-            frame_state: Mutex::new(FrameState { sequence: 0, pending: false }),
+            frame_state: Mutex::new(FrameState { sequence: 0, pending: false, vsync_baton: None, last_vsync: 0, recent_damage: Vec::new() }),
             frame_acked: Condvar::new(),
-            scratch: Mutex::new(vec![0; geometry.width as usize * geometry.height as usize * 4]),
+            stats: Some(Mutex::new(FrameStats { print: std::env::var_os("AERA_FLUTTER_STATS").is_some(), ..FrameStats::default() })),
             closed: AtomicBool::new(false),
             platform_thread: std::thread::current().id(),
             tasks: Mutex::new((BinaryHeap::new(), 0)),
@@ -117,16 +192,50 @@ impl Embedder {
 
         let user_data = &*shared as *const Shared as *mut c_void;
         let mut renderer: FlutterRendererConfig = unsafe { std::mem::zeroed() };
+        // Must stay alive until FlutterEngineInitialize has returned.
+        let mut device_extensions: Vec<*const std::ffi::c_char> = match &shared.gpu {
+            Backend::Vulkan(vulkan) => vulkan.reported_device_extensions(),
+            Backend::Gl(_) => Vec::new(),
+        };
+        let mut instance_extensions: Vec<*const std::ffi::c_char> = match &shared.gpu {
+            Backend::Vulkan(vulkan) => vulkan.reported_instance_extensions(),
+            Backend::Gl(_) => Vec::new(),
+        };
+        if let Backend::Vulkan(vulkan) = &shared.gpu {
+            eprintln!("aera-flutter: Vulkan on {}", vulkan.device_name());
+            let (instance, physical_device, device, queue_family_index, queue) = vulkan.handles();
+            renderer.type_ = kVulkan;
+            unsafe {
+                let vk = &mut renderer.__bindgen_anon_1.vulkan;
+                vk.struct_size = std::mem::size_of::<FlutterVulkanRendererConfig>();
+                vk.version = vulkan.api_version();
+                vk.instance = instance;
+                vk.physical_device = physical_device;
+                vk.device = device;
+                vk.queue_family_index = queue_family_index;
+                vk.queue = queue;
+                vk.enabled_instance_extension_count = instance_extensions.len();
+                vk.enabled_instance_extensions = instance_extensions.as_mut_ptr();
+                vk.enabled_device_extension_count = device_extensions.len();
+                vk.enabled_device_extensions = device_extensions.as_mut_ptr();
+                vk.get_instance_proc_address_callback = Some(vulkan_proc_address);
+                vk.get_next_image_callback = Some(vulkan_next_image);
+                vk.present_image_callback = Some(vulkan_present);
+            }
+        } else {
         renderer.type_ = kOpenGL;
         unsafe {
             let gl = &mut renderer.__bindgen_anon_1.open_gl;
             gl.struct_size = std::mem::size_of::<FlutterOpenGLRendererConfig>();
             gl.make_current = Some(make_current);
             gl.clear_current = Some(clear_current);
-            gl.present = Some(present);
-            gl.fbo_callback = Some(fbo_callback);
+            gl.present_with_info = Some(present);
+            gl.fbo_with_frame_info_callback = Some(fbo_callback);
+            gl.populate_existing_damage = Some(existing_damage);
             gl.make_resource_current = Some(make_resource_current);
             gl.gl_proc_resolver = Some(proc_resolver);
+            gl.surface_transformation = Some(flip_vertically);
+        }
         }
 
         let platform_runner = FlutterTaskRunnerDescription {
@@ -151,6 +260,7 @@ impl Embedder {
         args.command_line_argv = argv.as_ptr();
         args.platform_message_callback = Some(platform_message);
         args.custom_task_runners = &runners;
+        args.vsync_callback = Some(request_vsync);
         args.shutdown_dart_vm_when_done = true;
         args.log_tag = tag;
 
@@ -251,14 +361,15 @@ impl Embedder {
             // one, a host message or a newly posted task.
             let now = unsafe { shared.procs.GetCurrentTime.unwrap()() };
             let mut due = Vec::new();
-            let mut timeout_ms = -1;
+            let mut timeout_ms = self.answer_vsync(now);
             {
                 let mut tasks = shared.tasks.lock().unwrap();
                 while let Some(Reverse(next)) = tasks.0.peek() {
                     if next.target <= now {
                         due.push(tasks.0.pop().unwrap().0);
                     } else {
-                        timeout_ms = ((next.target - now) / 1_000_000).clamp(0, 1000) as i32;
+                        let wait = ((next.target - now) / 1_000_000).clamp(0, 1000) as i32;
+                        timeout_ms = if timeout_ms < 0 { wait } else { timeout_ms.min(wait) };
                         break;
                     }
                 }
@@ -301,6 +412,26 @@ impl Embedder {
         shared.frame_acked.notify_all();
         unsafe { shared.procs.Shutdown.unwrap()(self.engine()) };
         code
+    }
+
+    /// Answers Flutter's pending vsync request once a frame period has passed.
+    /// It does not wait for AERA to acknowledge the last frame, so Flutter
+    /// builds the next frame while AERA shows this one; `present` waits for
+    /// the acknowledgement before touching the shared slots. Returns how long the platform loop
+    /// may sleep before checking again, or -1 when nothing is waiting.
+    fn answer_vsync(&self, now: u64) -> i32 {
+        let shared = &*self.shared;
+        let mut state = shared.frame_state.lock().unwrap();
+        let Some(baton) = state.vsync_baton else { return -1 };
+        let earliest = state.last_vsync + FRAME_PERIOD_NS;
+        if now < earliest {
+            return ((earliest - now) / 1_000_000).max(1) as i32;
+        }
+        state.vsync_baton = None;
+        state.last_vsync = now;
+        drop(state);
+        unsafe { shared.procs.OnVsync.unwrap()(self.engine(), baton, now, now + FRAME_PERIOD_NS) };
+        -1
     }
 
     /// Returns false when the plugin should stop.
@@ -407,16 +538,32 @@ impl Shared {
     }
 }
 
+impl Shared {
+    fn gl(&self) -> &Gpu {
+        match &self.gpu {
+            Backend::Gl(gpu) => gpu,
+            Backend::Vulkan(_) => unreachable!("GL callback with the Vulkan renderer"),
+        }
+    }
+
+    fn vulkan(&self) -> &Vulkan {
+        match &self.gpu {
+            Backend::Vulkan(vulkan) => vulkan,
+            Backend::Gl(_) => unreachable!("Vulkan callback with the GL renderer"),
+        }
+    }
+}
+
 unsafe fn shared<'a>(user_data: *mut c_void) -> &'a Shared {
     &*(user_data as *const Shared)
 }
 
 unsafe extern "C" fn make_current(user_data: *mut c_void) -> bool {
-    shared(user_data).gpu.make_render_current()
+    shared(user_data).gl().make_render_current()
 }
 
 unsafe extern "C" fn clear_current(user_data: *mut c_void) -> bool {
-    shared(user_data).gpu.clear_current()
+    shared(user_data).gl().clear_current()
 }
 
 /// There is no resource context: Flutter then uploads images on the raster
@@ -428,30 +575,97 @@ unsafe extern "C" fn make_resource_current(_user_data: *mut c_void) -> bool {
     false
 }
 
-unsafe extern "C" fn fbo_callback(user_data: *mut c_void) -> u32 {
-    shared(user_data).gpu.framebuffer()
+/// Draws every frame upside down. GL reads rows bottom-up, so the readback
+/// then lands top-down in AERA's frame slot with no CPU pass.
+unsafe extern "C" fn flip_vertically(user_data: *mut c_void) -> FlutterTransformation {
+    FlutterTransformation {
+        scaleX: 1.0,
+        skewX: 0.0,
+        transX: 0.0,
+        skewY: 0.0,
+        scaleY: -1.0,
+        transY: shared(user_data).surface.geometry().height as f64,
+        pers0: 0.0,
+        pers1: 0.0,
+        pers2: 1.0,
+    }
+}
+
+/// Flutter wants to start a frame. Called on the UI thread; the platform loop
+/// answers it (see `Embedder::answer_vsync`).
+unsafe extern "C" fn request_vsync(user_data: *mut c_void, baton: isize) {
+    let s = shared(user_data);
+    s.frame_state.lock().unwrap().vsync_baton = Some(baton);
+    s.wake();
+}
+
+unsafe extern "C" fn fbo_callback(user_data: *mut c_void, _info: *const FlutterFrameInfo) -> u32 {
+    shared(user_data).gl().framebuffer()
 }
 
 unsafe extern "C" fn proc_resolver(user_data: *mut c_void, name: *const c_char) -> *mut c_void {
-    shared(user_data).gpu.proc_address(CStr::from_ptr(name))
+    shared(user_data).gl().proc_address(CStr::from_ptr(name))
 }
 
-/// Raster thread: copy the finished frame into the free slot and present it,
-/// waiting first for AERA to release the previous one.
-unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
+/// Our framebuffer keeps the previous frame, so nothing needs repainting
+/// beyond what Flutter itself marks as changed.
+unsafe extern "C" fn existing_damage(_user_data: *mut c_void, _fbo: isize, damage: *mut FlutterDamage) {
+    // The engine only turns on partial repaint when this holds at least one
+    // rectangle, so report an empty one.
+    static mut NOTHING: FlutterRect = FlutterRect { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+    let damage = &mut *damage;
+    damage.num_rects = 1;
+    damage.damage = std::ptr::addr_of_mut!(NOTHING);
+}
+
+/// Bounding box of Flutter's damage rectangles, or None for the whole frame.
+fn damage_bounds(damage: &FlutterDamage) -> Option<Region> {
+    if damage.num_rects == 0 || damage.damage.is_null() {
+        return None;
+    }
+    let rects = unsafe { std::slice::from_raw_parts(damage.damage, damage.num_rects) };
+    rects.iter().fold(Some(Region::default()), |bounds, r| {
+        let x = r.left.floor() as i32;
+        let y = r.top.floor() as i32;
+        let rect = Region { x, y, width: r.right.ceil() as i32 - x, height: r.bottom.ceil() as i32 - y };
+        bounds.map(|b| b.union(rect))
+    })
+}
+
+/// Raster thread: copy the changed part of the finished frame into the free
+/// slot and hand it to AERA, waiting first for AERA to release the previous
+/// one.
+unsafe extern "C" fn present(user_data: *mut c_void, info: *const FlutterPresentInfo) -> bool {
     let s = shared(user_data);
-    let mut state = s.frame_state.lock().unwrap();
-    while state.pending && !s.closed.load(Ordering::Acquire) {
-        state = s.frame_acked.wait_timeout(state, Duration::from_millis(250)).unwrap().0;
+    let damage = if std::env::var_os("AERA_FLUTTER_FULL_FRAMES").is_some() { None } else { damage_bounds(&(*info).frame_damage) };
+    // Start the GPU copy before waiting for AERA, so the two overlap. The
+    // slot itself is only written once AERA has released it.
+    let geometry = s.surface.geometry();
+    let (next, region) = {
+        let mut state = s.frame_state.lock().unwrap();
+        let history = geometry.slots as usize - 1;
+        let region = if state.recent_damage.len() == history {
+            damage.and_then(|now| state.recent_damage.iter().try_fold(now, |bounds, before| Some(bounds.union((*before)?))))
+        } else {
+            None
+        };
+        state.recent_damage.push(damage);
+        let excess = state.recent_damage.len().saturating_sub(history);
+        state.recent_damage.drain(..excess);
+        (state.sequence.wrapping_add(1), region)
+    };
+    let readback = s.gl().start_read(region);
+    let Some((state, ack_wait)) = wait_for_ack(s) else { return false };
+    let (readback, convert) = s.gl().finish_read(readback, s.surface.slot(next), geometry.stride as usize);
+    if let Some(stats) = &s.stats {
+        let area = region.map_or(1.0, |r| r.area() as f64 / (geometry.width as f64 * geometry.height as f64));
+        stats.lock().unwrap().add(ack_wait, readback, convert, area);
     }
-    if s.closed.load(Ordering::Acquire) {
-        return false;
-    }
-    let next = state.sequence.wrapping_add(1);
-    {
-        let mut scratch = s.scratch.lock().unwrap();
-        s.gpu.read_frame(&mut scratch, s.surface.slot(next), s.surface.geometry().stride as usize);
-    }
+    send_frame(s, state, next)
+}
+
+/// Hands the filled slot for `next` to AERA.
+fn send_frame(s: &Shared, mut state: std::sync::MutexGuard<'_, FrameState>, next: u32) -> bool {
     let present = Message { request_id: next, value: s.surface.slot_of(next), ..Message::new(kind::PRESENT) };
     if s.control.send(&present).is_err() {
         s.closed.store(true, Ordering::Release);
@@ -461,6 +675,46 @@ unsafe extern "C" fn present(user_data: *mut c_void) -> bool {
     state.sequence = next;
     state.pending = true;
     true
+}
+
+/// Waits until AERA has released the previous frame. None when closing.
+fn wait_for_ack(s: &Shared) -> Option<(std::sync::MutexGuard<'_, FrameState>, Duration)> {
+    let waited = std::time::Instant::now();
+    let mut state = s.frame_state.lock().unwrap();
+    while state.pending && !s.closed.load(Ordering::Acquire) {
+        state = s.frame_acked.wait_timeout(state, Duration::from_millis(250)).unwrap().0;
+    }
+    if s.closed.load(Ordering::Acquire) {
+        return None;
+    }
+    Some((state, waited.elapsed()))
+}
+
+unsafe extern "C" fn vulkan_proc_address(user_data: *mut c_void, instance: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void {
+    shared(user_data).vulkan().instance_proc_address(instance, CStr::from_ptr(name))
+}
+
+unsafe extern "C" fn vulkan_next_image(user_data: *mut c_void, _info: *const FlutterFrameInfo) -> FlutterVulkanImage {
+    let (image, format) = shared(user_data).vulkan().next_image();
+    FlutterVulkanImage { struct_size: std::mem::size_of::<FlutterVulkanImage>(), image, format }
+}
+
+/// Raster thread: Flutter finished drawing `image` and waited for the GPU.
+unsafe extern "C" fn vulkan_present(user_data: *mut c_void, image: *const FlutterVulkanImage) -> bool {
+    let s = shared(user_data);
+    let Some((mut state, ack_wait)) = wait_for_ack(s) else { return false };
+    let next = state.sequence.wrapping_add(1);
+    let start = std::time::Instant::now();
+    let stride = s.surface.geometry().stride as usize;
+    if let Err(error) = s.vulkan().read_frame((*image).image, s.surface.slot(next), stride) {
+        eprintln!("aera-flutter: {error}");
+        return false;
+    }
+    if let Some(stats) = &s.stats {
+        stats.lock().unwrap().add(ack_wait, start.elapsed(), Duration::ZERO, 1.0);
+    }
+    state.recent_damage.clear();
+    send_frame(s, state, next)
 }
 
 unsafe extern "C" fn runs_on_platform_thread(user_data: *mut c_void) -> bool {
@@ -495,13 +749,30 @@ unsafe extern "C" fn platform_message(message: *const FlutterPlatformMessage, us
 /// directory named in `AERA_PLUGIN_ROOT`.
 pub fn default_config(root: &Path) -> Config {
     let share = root.join("usr/share/flutter");
+    // Nobody can reach the Dart VM service on the phone, so don't open it.
+    let mut extra_engine_args = vec!["--disable-vm-service".to_string()];
+    // `usr/share/flutter/renderer` (or AERA_FLUTTER_RENDERER) picks the
+    // renderer: `gl` (default), `vulkan` (Skia) or `impeller` (Impeller on
+    // Vulkan).
+    let choice = std::env::var("AERA_FLUTTER_RENDERER")
+        .ok()
+        .or_else(|| std::fs::read_to_string(share.join("renderer")).ok())
+        .unwrap_or_default();
+    let renderer = match choice.trim() {
+        "vulkan" => Renderer::Vulkan,
+        "impeller" => {
+            extra_engine_args.push("--enable-impeller=true".into());
+            Renderer::Vulkan
+        }
+        _ => Renderer::Gl,
+    };
     Config {
         engine_library: root.join("usr/lib/libflutter_engine.so"),
         assets: share.join("flutter_assets"),
         icu_data: share.join("icudtl.dat"),
         aot_library: root.join("usr/lib/libapp.so"),
         locale: std::env::var("AERA_LOCALE").unwrap_or_else(|_| "en".into()),
-        // Nobody can reach the Dart VM service on the phone, so don't open it.
-        extra_engine_args: vec!["--disable-vm-service".into()],
+        extra_engine_args,
+        renderer,
     }
 }

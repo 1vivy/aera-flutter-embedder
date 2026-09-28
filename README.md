@@ -47,6 +47,8 @@ browser jail stays AERA Browser's alone.
 | `tools/assemble_runtime.py` | builds the arm64 runtime: glibc, Flutter engine, Mesa, fonts, launcher and embedder, as real files resolved by soname |
 | `tools/make_aerap.py` | packs a staged payload into an installable `.aerap` under the app's own ID |
 | `tools/package_kits.sh` | makes the runtime and simulator kits, published as `generic-host-flutter-<version>` releases |
+| `tools/build_engine.sh` | builds the arm64 release or profile embedder engine and its x64-hosted `gen_snapshot` from Flutter's source (run by the Engine workflow) |
+| `tools/build_aot_app.sh` | compiles an app into an arm64 `libapp.so` for one of those engines |
 
 ## Build
 
@@ -64,6 +66,27 @@ Mesa 26.2.2 is built for arm64 with `-Dgallium-drivers=zink,softpipe
 -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm,kgsl -Dplatforms=` and AERA
 Browser's `mesa-26.2.2-zink-kgsl-surfaceless.patch`.
 
+## Renderers
+
+GL (Skia on EGL, through Zink on the phone) is the default. An app can pick
+another by shipping `usr/share/flutter/renderer` containing one word, or the
+embedder reads `AERA_FLUTTER_RENDERER`:
+
+- `gl`: Skia on OpenGL ES.
+- `vulkan`: Skia on Vulkan, straight on Turnip without Zink.
+- `impeller`: Impeller on Vulkan.
+
+On GL, Flutter draws each frame upside down so the readback lands top-down,
+the GPU does the BGRA swizzle where `GL_EXT_read_format_bgra` exists, the
+readback goes through a pixel pack buffer so it overlaps waiting for
+`FRAME_DONE`, and only the damaged region (unioned over the frames still in
+the other slots) is copied. Vsync is paced at 60 Hz without waiting for
+`FRAME_DONE`, so Flutter builds the next frame while AERA shows this one. On
+Vulkan, Flutter draws into two device-local images and each finished frame is
+copied into the slot with one GPU copy; damage-only copies are GL only for
+now. Set `AERA_FLUTTER_STATS` to print per-frame timings; they are also written
+to `/tmp/aera-flutter-stats` every 120 frames.
+
 ## Switching to the official host
 
 1. Replace the `ASSUMED` constants and kinds in `src/host.rs` with the real
@@ -73,7 +96,9 @@ Browser's `mesa-26.2.2-zink-kgsl-surfaceless.patch`.
 
 ## Limits
 
-- The engine is Google's debug (JIT) embedder build, so apps are debug builds
-  and must use exactly the Flutter release named in the kit.
+- The runtime kit carries Google's debug (JIT) embedder build, so apps are
+  debug builds and must use exactly the Flutter release named in the kit.
+  Release and profile (AOT) engines are built from source by the Engine
+  workflow; the embedder loads `usr/lib/libapp.so` when the engine is AOT.
 - The Flutter engine only looks for fonts in `/usr/share/fonts`; `aera-plugin`
   binds the payload's fonts there in its own mount namespace.

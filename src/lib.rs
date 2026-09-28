@@ -12,3 +12,4 @@ mod ffi;
 pub mod gl;
 pub mod host;
 pub mod text_input;
+pub mod vk;
