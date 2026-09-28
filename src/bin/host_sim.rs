@@ -9,10 +9,15 @@
 //! aera-host-sim --worker target/release/aera-browser-worker --root payload/ \
 //!     --out frames/ --until 3000 --tap 316,655@1000 --key h@2000 --save-at 2500
 //!     [--drag 100,300>200,400@1500] [--ack-delay 12]
+//!     [--back 3000] [--forward 3100] [--reload 3200] [--open URL@3300] [--zoom 150@3400]
 //! ```
 //!
 //! Times are milliseconds after the first frame; taps use AERA's 360x700 view
 //! pixels.
+//!
+//! Like AERA, `--back` reaches the app only after its last STATUS said it
+//! can go back, and while the keyboard is up Back closes the keyboard and
+//! touches are not delivered.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -31,6 +36,8 @@ enum Input {
     Drag(i32, i32, i32, i32),
     Key(u32),
     Back,
+    /// A packet with no coordinates: FORWARD, RELOAD, OPEN (text), SET_ZOOM (value).
+    Chrome(u32, u32, String),
 }
 
 struct Options {
@@ -98,6 +105,17 @@ fn parse() -> Result<Options, String> {
                 options.script.push((frame, Input::Key(code)));
             }
             "--back" => options.script.push((value()?.parse().map_err(|_| "bad --back")?, Input::Back)),
+            "--forward" => options.script.push((value()?.parse().map_err(|_| "bad --forward")?, Input::Chrome(kind::FORWARD, 0, String::new()))),
+            "--reload" => options.script.push((value()?.parse().map_err(|_| "bad --reload")?, Input::Chrome(kind::RELOAD, 0, String::new()))),
+            "--open" => {
+                let (url, frame) = at(&value()?)?;
+                options.script.push((frame, Input::Chrome(kind::OPEN, 0, url)));
+            }
+            "--zoom" => {
+                let (zoom, frame) = at(&value()?)?;
+                let zoom: u32 = zoom.parse().map_err(|_| "bad --zoom")?;
+                options.script.push((frame, Input::Chrome(kind::SET_ZOOM, zoom.clamp(50, 300), String::new())));
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -179,6 +197,8 @@ fn main() {
     let mut saves = saves.into_iter().peekable();
     let mut last = 0u32;
     let mut exit = 0;
+    let mut can_back = false;
+    let mut keyboard = false;
     let save = |label: String, last: u32| {
         let path = options.out.join(format!("{label}.png"));
         save_png(&path, frames.slot(last)).expect("write png");
@@ -192,6 +212,11 @@ fn main() {
                 let send = |kind: u32, x: i32, y: i32, value: u32| {
                     host.send(&Packet { kind, x, y, value, ..Packet::new(kind) }).expect("send input");
                 };
+                let touch = matches!(input, Input::Tap(..) | Input::Drag(..));
+                if touch && keyboard {
+                    println!("touch not delivered: the keyboard is up");
+                    continue;
+                }
                 match input {
                     Input::Tap(x, y) => {
                         send(kind::TOUCH_DOWN, x, y, 0);
@@ -207,7 +232,15 @@ fn main() {
                         send(kind::TOUCH_UP, x2, y2, 0);
                     }
                     Input::Key(code) => send(kind::KEY, 0, 0, code),
-                    Input::Back => send(kind::BACK, 0, 0, 0),
+                    Input::Back if keyboard => {
+                        keyboard = false;
+                        println!("back: closed the keyboard");
+                    }
+                    Input::Back if can_back => send(kind::BACK, 0, 0, 0),
+                    Input::Back => println!("back: leaves the app (it has not said it can go back)"),
+                    Input::Chrome(kind, value, text) => {
+                        host.send(&Packet { value, text, ..Packet::new(kind) }).expect("send input")
+                    }
                 }
             }
             while saves.peek().is_some_and(|at| *at <= ms) {
@@ -254,9 +287,19 @@ fn main() {
                 ack.sequence = last;
                 host.send(&ack).expect("ack");
             }
-            kind::KEYBOARD_SHOW => println!("keyboard shown (purpose {})", packet.value),
-            kind::KEYBOARD_HIDE => println!("keyboard hidden"),
-            kind::STATUS | kind::ERROR => println!("{}: {}", if packet.kind == kind::ERROR { "error" } else { "status" }, packet.text),
+            kind::KEYBOARD_SHOW => {
+                keyboard = true;
+                println!("keyboard shown (purpose {})", packet.value)
+            }
+            kind::KEYBOARD_HIDE => {
+                keyboard = false;
+                println!("keyboard hidden")
+            }
+            kind::STATUS => {
+                can_back = packet.x == 1;
+                println!("status: back {} forward {} progress {} {:?}", packet.x, packet.y, packet.value, packet.text)
+            }
+            kind::ERROR => println!("error: {}", packet.text),
             _ => {}
         }
     }

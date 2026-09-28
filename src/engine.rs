@@ -16,6 +16,7 @@ use crate::bridge::{self, kind, Control, Frames, Packet};
 use crate::ffi::*;
 use crate::gl::{Gpu, Region};
 use crate::vk::Vulkan;
+use crate::system::{self, System};
 use crate::text_input::{Effect, TextInput};
 
 pub struct Config {
@@ -82,6 +83,7 @@ struct Shared {
     tasks: Mutex<(BinaryHeap<Reverse<Queued>>, u64)>,
     wake: i32,
     text_input: Mutex<TextInput>,
+    system: Mutex<System>,
     stats: Option<Mutex<FrameStats>>,
 }
 
@@ -170,6 +172,7 @@ impl Embedder {
             tasks: Mutex::new((BinaryHeap::new(), 0)),
             wake,
             text_input: Mutex::new(TextInput::default()),
+            system: Mutex::new(System::default()),
         });
 
         let mut strings = Vec::new();
@@ -300,12 +303,7 @@ impl Embedder {
     }
 
     fn send_metrics(&self) {
-        let mut metrics: FlutterWindowMetricsEvent = unsafe { std::mem::zeroed() };
-        metrics.struct_size = std::mem::size_of::<FlutterWindowMetricsEvent>();
-        metrics.width = bridge::WIDTH as usize;
-        metrics.height = bridge::HEIGHT as usize;
-        metrics.pixel_ratio = bridge::DEVICE_SCALE;
-        unsafe { self.shared.procs.SendWindowMetricsEvent.unwrap()(self.engine(), &metrics) };
+        self.shared.send_metrics();
     }
 
     fn send_locale(&self, locale: &str) {
@@ -437,7 +435,11 @@ impl Embedder {
                 state.pending = false;
                 shared.frame_acked.notify_all();
             }
-            kind::TOUCH_DOWN => self.pointer(&[kAdd, kDown], packet),
+            kind::TOUCH_DOWN => {
+                let effects = shared.system.lock().unwrap().from_host(packet);
+                shared.apply_system(effects);
+                self.pointer(&[kAdd, kDown], packet)
+            }
             kind::TOUCH_MOVE => self.pointer(&[kMove], packet),
             kind::TOUCH_UP => self.pointer(&[kUp, kRemove], packet),
             kind::KEY => {
@@ -446,6 +448,10 @@ impl Embedder {
             }
             kind::BACK => shared.send_message("flutter/navigation", br#"{"method":"popRoute","args":null}"#),
             kind::CLOSE => return false,
+            kind::FORWARD | kind::RELOAD | kind::STOP | kind::OPEN | kind::SET_ZOOM => {
+                let effects = shared.system.lock().unwrap().from_host(packet);
+                shared.apply_system(effects);
+            }
             // Browser-only requests (addresses, zoom, cookies, downloads)
             // have no meaning for a Flutter app.
             _ => {}
@@ -471,6 +477,28 @@ impl Shared {
         unsafe { self.procs.SendPlatformMessage.unwrap()(self.engine(), &message) };
     }
 
+    fn send_metrics(&self) {
+        let mut metrics: FlutterWindowMetricsEvent = unsafe { std::mem::zeroed() };
+        metrics.struct_size = std::mem::size_of::<FlutterWindowMetricsEvent>();
+        metrics.width = bridge::WIDTH as usize;
+        metrics.height = bridge::HEIGHT as usize;
+        metrics.pixel_ratio = bridge::DEVICE_SCALE;
+        metrics.physical_view_inset_bottom = self.system.lock().unwrap().bottom_inset();
+        unsafe { self.procs.SendWindowMetricsEvent.unwrap()(self.engine(), &metrics) };
+    }
+
+    fn apply_system(&self, effects: Vec<system::Effect>) {
+        for effect in effects {
+            match effect {
+                system::Effect::Host(packet) => {
+                    let _ = self.control.send(&packet);
+                }
+                system::Effect::Dart(call) => self.send_message(system::CHANNEL, call.to_string().as_bytes()),
+                system::Effect::Metrics => self.send_metrics(),
+            }
+        }
+    }
+
     fn apply(&self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
@@ -478,9 +506,13 @@ impl Shared {
                     let mut packet = Packet::new(kind::KEYBOARD_SHOW);
                     packet.value = purpose;
                     let _ = self.control.send(&packet);
+                    let effects = self.system.lock().unwrap().keyboard_changed(true);
+                    self.apply_system(effects);
                 }
                 Effect::HideKeyboard => {
                     let _ = self.control.send(&Packet::new(kind::KEYBOARD_HIDE));
+                    let effects = self.system.lock().unwrap().keyboard_changed(false);
+                    self.apply_system(effects);
                 }
                 Effect::ToFlutter(call) => self.send_message("flutter/textinput", call.to_string().as_bytes()),
             }
@@ -504,6 +536,11 @@ impl Shared {
                 let effects = self.text_input.lock().unwrap().handle(method, &call["args"]);
                 self.apply(effects);
                 Some(b"[null]".to_vec())
+            }
+            system::CHANNEL => {
+                let (reply, effects) = self.system.lock().unwrap().call(method, &call["args"]);
+                self.apply_system(effects);
+                Some(if reply.is_null() { Vec::new() } else { reply.to_string().into_bytes() })
             }
             "flutter/platform" => match method {
                 "SystemNavigator.pop" => {
