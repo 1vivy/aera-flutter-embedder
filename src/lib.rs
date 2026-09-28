@@ -5,6 +5,7 @@
 //! phone.
 
 pub mod bridge;
+mod clipboard;
 pub mod engine;
 #[allow(dead_code)]
 mod ffi;

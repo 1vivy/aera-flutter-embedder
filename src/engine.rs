@@ -10,12 +10,13 @@ use std::sync::{Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::bridge::{self, kind, Control, Frames, Packet};
 use crate::ffi::*;
 use crate::gl::{Gpu, Region};
 use crate::vk::Vulkan;
+use crate::clipboard;
 use crate::system::{self, System};
 use crate::text_input::{Effect, TextInput};
 
@@ -548,8 +549,7 @@ impl Shared {
                     self.wake();
                     Some(b"[null]".to_vec())
                 }
-                "Clipboard.hasStrings" => Some(json!([{"value": false}]).to_string().into_bytes()),
-                _ => None,
+                _ => clipboard::handle(method, &call["args"]).map(|reply| reply.to_string().into_bytes()),
             },
             _ => None,
         }
