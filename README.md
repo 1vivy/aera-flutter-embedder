@@ -22,8 +22,9 @@ browser chrome over it.
    --aera-host-api=3` with its control channel on fd 4 and, assumed, a pixel
    surface memfd on fd 3.
 2. `aera-plugin` is a small static program. It finds the runtime around
-   itself, binds the payload's fonts at `/usr/share/fonts` in a private mount
-   namespace, points Mesa and the Vulkan loader into the payload, and execs
+   itself, binds AERA's fonts (`/twres/fonts`) at `/usr/share/fonts` and the
+   payload's CA bundle at `/etc/ssl/certs/ca-certificates.crt` in a private
+   mount namespace, points Mesa and the Vulkan loader into the payload, and execs
    `usr/bin/aera-flutter` through the runtime's own glibc loader.
 3. `aera-flutter` handshakes (`HELLO` → `HELLO_ACK` with the pixel surface
    feature → `SURFACE` with width, height, stride, slots and scale), renders
@@ -111,4 +112,5 @@ to `/tmp/aera-flutter-stats` every 120 frames.
   Release and profile (AOT) engines are built from source by the Engine
   workflow; the embedder loads `usr/lib/libapp.so` when the engine is AOT.
 - The Flutter engine only looks for fonts in `/usr/share/fonts`; `aera-plugin`
-  binds the payload's fonts there in its own mount namespace.
+  binds AERA's own fonts from `/twres/fonts` there in its own mount
+  namespace, or the payload's Roboto if recovery has none.

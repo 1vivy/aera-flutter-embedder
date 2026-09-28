@@ -11,8 +11,9 @@
 //!
 //! Flutter's engine only reads fonts from `/usr/share/fonts/` and Dart only
 //! trusts `/etc/ssl/certs/ca-certificates.crt`. Plugins run as root, so the
-//! launcher gives itself a private mount namespace and binds the payload's
-//! fonts and CA bundle there; recovery's own mounts are not changed.
+//! launcher gives itself a private mount namespace and binds AERA's fonts
+//! (`/twres/fonts`) and the payload's CA bundle there; recovery's own mounts
+//! are not changed.
 //!
 //! Build it static so the kernel needs no loader to start it:
 //! `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p aera-plugin --target <triple>`
@@ -84,13 +85,25 @@ fn bind(source: &Path, target: &Path) {
     }
 }
 
+/// AERA's own fonts (Roboto plus Noto and WenQuanYi for other scripts,
+/// `aeraui/localization/fonts/aera_fallback.cpp`).
+const SYSTEM_FONTS: &str = "/twres/fonts";
+
 /// Flutter's engine only reads fonts from `/usr/share/fonts/`, and Dart's
 /// HttpClient only trusts `/etc/ssl/certs/ca-certificates.crt` (it ignores
-/// SSL_CERT_FILE). Recovery has neither, so the payload's copies are bound
-/// there. Without them text or HTTPS is missing, not the app.
+/// SSL_CERT_FILE). Recovery has neither there, so AERA's own fonts are bound
+/// at the first, falling back to the payload's Roboto when recovery has none,
+/// and the payload's CA bundle at the second. Without them text or HTTPS is
+/// missing, not the app.
 fn bind_runtime_files(root: &Path) {
-    let files = [("usr/share/fonts", "/usr/share/fonts"), ("etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt")];
-    let wanted: Vec<_> = files.iter().map(|(from, to)| (root.join(from), Path::new(to))).filter(|(from, _)| from.exists()).collect();
+    let fonts = [PathBuf::from(SYSTEM_FONTS), root.join("usr/share/fonts")].into_iter().find(|p| p.is_dir());
+    let wanted: Vec<(PathBuf, &Path)> = [
+        (fonts, Path::new("/usr/share/fonts")),
+        (Some(root.join("etc/ssl/certs/ca-certificates.crt")), Path::new("/etc/ssl/certs/ca-certificates.crt")),
+    ]
+    .into_iter()
+    .filter_map(|(from, to)| Some((from.filter(|p| p.exists())?, to)))
+    .collect();
     if wanted.is_empty() || !private_namespace(root) {
         return;
     }

@@ -12,6 +12,12 @@
 //!   `KEYBOARD_INSET` whenever it shows, hides or resizes (asked for in
 //!   aera-flutter-demo#1). Until the host has sent one, the embedder uses
 //!   the browser keyboard's proportions when it asks for the keyboard.
+//! - The surface runs under the display's rounded corners and AERA's
+//!   gesture strips. `getState` gives the app a bottom safe area
+//!   (`padding`) and the gesture strips (`gestureInsets`), which
+//!   `AeraScope` puts in `MediaQuery`. AERA has no value for either, so
+//!   these are measured on the phone and scaled to the surface until the
+//!   host reports them (asked for in aera-flutter-demo#1).
 //!
 //! Calls from Dart use the standard JSON method codec.
 
@@ -23,6 +29,20 @@ pub const CHANNEL: &str = "aera/system";
 /// AERA's portrait keyboard is 760 px of a 2708 px high screen in the
 /// browser (`web_scene.cpp`); used only until the host reports its own.
 const KEYBOARD_SHARE: f64 = 760.0 / 2708.0;
+
+/// AERA's screen is 3168 px high (`engine.cpp`); the surface is assumed to
+/// cover it.
+const SCREEN_HEIGHT: f64 = 3168.0;
+
+/// Bottom safe area in screen px: AERA takes the bottom
+/// `max(64, 3168 / 44)` = 72 px for its Recents swipe (`bottom_edge`), and
+/// the rounded corners clip the bottom rows; 96 px clears both.
+const BOTTOM_PADDING: f64 = 96.0;
+
+/// AERA's gestures in screen px [left, top, right, bottom]: the back edges
+/// are `max(72, 1440 / 20)` = 72 px from each side, the bottom is the
+/// Recents strip.
+const GESTURE_INSETS: [f64; 4] = [72.0, 0.0, 72.0, 72.0];
 
 #[derive(Debug)]
 pub struct System {
@@ -51,6 +71,11 @@ impl System {
         System { surface_height: surface_height as f64, can_back: false, can_forward: false, inset: 0.0, host_reports: false }
     }
 
+    /// Screen px to surface px.
+    fn screen(&self, px: f64) -> f64 {
+        px * self.surface_height / SCREEN_HEIGHT
+    }
+
     pub fn bottom_inset(&self) -> f64 {
         self.inset
     }
@@ -69,7 +94,12 @@ impl System {
             }
             "setStatus" => (json!([null]), Vec::new()),
             "getState" => (
-                json!([{"keyboardVisible": self.inset > 0.0, "keyboardInset": self.inset}]),
+                json!([{
+                    "keyboardVisible": self.inset > 0.0,
+                    "keyboardInset": self.inset,
+                    "padding": [0.0, 0.0, 0.0, self.screen(BOTTOM_PADDING)],
+                    "gestureInsets": GESTURE_INSETS.map(|inset| self.screen(inset)),
+                }]),
                 Vec::new(),
             ),
             _ => (Value::Null, Vec::new()),
@@ -124,6 +154,14 @@ mod tests {
         assert!(system.keyboard_changed(false).is_empty());
         assert_eq!(system.from_host(&Message::new(kind::KEYBOARD_INSET)).len(), 2);
         assert_eq!(system.bottom_inset(), 0.0);
+    }
+
+    #[test]
+    fn safe_area_scales_to_the_surface() {
+        let (reply, _) = System::new(2100).call("getState", &Value::Null);
+        let bottom = reply[0]["padding"][3].as_f64().unwrap();
+        assert!((bottom - 63.6).abs() < 0.1, "{bottom}");
+        assert!((reply[0]["gestureInsets"][0].as_f64().unwrap() - 47.7).abs() < 0.1);
     }
 
     #[test]
