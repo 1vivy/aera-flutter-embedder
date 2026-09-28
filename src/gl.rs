@@ -342,6 +342,9 @@ impl Gpu {
             if !bgra {
                 (g.read_pixels)(r.x, r.y, r.width, r.height, GL_RGBA, GL_UNSIGNED_BYTE, offset);
             }
+            // Skia caches pack state and assumes the defaults; its own
+            // glReadPixels (toImage, toByteData) breaks if these leak.
+            (g.pixel_storei)(GL_PACK_ROW_LENGTH, 0);
             (g.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
             (g.flush)();
         }
