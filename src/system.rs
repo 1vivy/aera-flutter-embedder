@@ -42,9 +42,9 @@ const SCALE: f64 = HEIGHT as f64 / 2708.0;
 /// `max(64, 3168 / 44)` = 72 screen px for its Recents swipe
 /// (`engine.cpp`, `bottom_edge`), and the display's rounded corners clip
 /// the bottom rows. 96 screen px clears both, for a typical phone's corner
-/// radius (about 100 to 140 px on a 1440 px wide screen); a fixed value, not
-/// asked of the host (about 25 logical px, near
-/// Android's 24 dp gesture bar).
+/// radius (about 100 to 140 px on a 1440 px wide screen). It is about 25
+/// logical px, near Android's 24 dp gesture bar, and a fixed value: AERA is
+/// not asked for it.
 pub const BOTTOM_PADDING: f64 = 96.0 * SCALE;
 
 /// AERA's own gestures, in frame pixels [left, top, right, bottom]: the back
