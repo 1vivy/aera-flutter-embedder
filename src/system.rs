@@ -41,7 +41,9 @@ const SCALE: f64 = HEIGHT as f64 / 2708.0;
 /// The bottom safe area, in frame pixels. AERA takes touches in the bottom
 /// `max(64, 3168 / 44)` = 72 screen px for its Recents swipe
 /// (`engine.cpp`, `bottom_edge`), and the display's rounded corners clip
-/// the bottom rows. 96 screen px clears both (about 25 logical px, near
+/// the bottom rows. 96 screen px clears both, for a typical phone's corner
+/// radius (about 100 to 140 px on a 1440 px wide screen); a fixed value, not
+/// asked of the host (about 25 logical px, near
 /// Android's 24 dp gesture bar).
 pub const BOTTOM_PADDING: f64 = 96.0 * SCALE;
 
