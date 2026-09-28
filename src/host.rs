@@ -29,7 +29,7 @@
 //! | Handshake | `HELLO` (3..3) → `HELLO_ACK` with [`FEATURE_PIXEL_SURFACE`] → `SURFACE` |
 //! | Pixels | sealed memfd on fd `AERA_SURFACE_FD` (3), BGRA8888, top-down, `slots` frames of `stride * height` |
 //! | Frames | worker sends `PRESENT` for slot `sequence % slots`, host answers `FRAME_DONE` |
-//! | Input | `TOUCH_DOWN/MOVE/UP` in surface pixels, `KEY` code points, `BACK` |
+//! | Input | `TOUCH_DOWN/MOVE/UP` in surface pixels, `KEY` code points, `BACK`, `KEYBOARD_INSET` |
 //! | Lifecycle | Host API 2's `LIFECYCLE` resume, pause, stop |
 //! | Process | root in recovery's own namespaces, no jail, like every Host API 2 plugin (plugins are recovery modules) |
 //! | Filesystem | payload extracted like Host API 2, named in `AERA_PLUGIN_ROOT`; recovery's `/` stays `/` |
@@ -98,13 +98,17 @@ pub mod kind {
     pub const KEY: u32 = 73;
     /// AERA's edge-back gesture.
     pub const BACK: u32 = 74;
+    /// AERA's keyboard covers `value` surface pixels at the bottom; 0 when
+    /// hidden. Sent whenever it shows, hides (including by AERA itself) or
+    /// resizes.
+    pub const KEYBOARD_INSET: u32 = 75;
 
     pub fn from_worker(kind: u32) -> bool {
         (HELLO..=KEYBOARD_HIDE).contains(&kind)
     }
 
     pub fn from_host(kind: u32) -> bool {
-        (HELLO_ACK..=BACK).contains(&kind)
+        (HELLO_ACK..=KEYBOARD_INSET).contains(&kind)
     }
 }
 

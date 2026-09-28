@@ -66,6 +66,16 @@ Mesa 26.2.2 is built for arm64 with `-Dgallium-drivers=zink,softpipe
 -Dvulkan-drivers=freedreno -Dfreedreno-kmds=msm,kgsl -Dplatforms=` and AERA
 Browser's `mesa-26.2.2-zink-kgsl-surfaceless.patch`.
 
+## AERA's system features
+
+The worker also carries AERA's own chrome to the app on the `aera/system`
+channel (`src/system.rs`); apps use it through the `aera_flutter` Dart
+package in [aera-flutter-sdk](https://github.com/1vivy/aera-flutter-sdk).
+AERA sends its back gesture only while the worker's last `STATUS` said the
+app can go back, so the app reports that from its navigator. Forward, Reload,
+Stop, Home and typed addresses arrive as events, and while AERA's keyboard is
+up the app gets a bottom view inset of the keyboard's height.
+
 ## Renderers
 
 GL (Skia on EGL, through Zink on the phone) is the default. An app can pick

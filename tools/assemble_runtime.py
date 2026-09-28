@@ -17,7 +17,15 @@ run time.
         --engine engine/linux-arm64/libflutter_engine.so \\
         --icu engine/icudtl.dat --mesa mesa/stage \\
         --sysroot /usr/lib/aarch64-linux-gnu --sysroot /lib/aarch64-linux-gnu \\
-        --fonts /usr/share/fonts/truetype/roboto/unhinted/RobotoTTF
+        --fonts /usr/share/fonts/truetype/roboto/unhinted/RobotoTTF \\
+        --font-file /usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf \\
+        --ca-bundle /etc/ssl/certs/ca-certificates.crt
+
+Fonts go to /usr/share/fonts, where the engine looks for them and falls back
+from font to font for characters Roboto lacks (CJK, Devanagari, emoji). The CA
+bundle goes to /etc/ssl/certs/ca-certificates.crt, the first place Dart looks
+for trusted roots on Linux; without it every HTTPS request fails with
+CERTIFICATE_VERIFY_FAILED.
 """
 import argparse
 import json
@@ -64,6 +72,10 @@ def main():
                         help="directory to resolve system libraries from (repeatable)")
     parser.add_argument("--fonts", action="append", default=[],
                         help="directory of .ttf/.otf files to ship in /usr/share/fonts")
+    parser.add_argument("--font-file", action="append", default=[], type=Path,
+                        help="one more font file to ship in /usr/share/fonts (repeatable)")
+    parser.add_argument("--ca-bundle", type=Path,
+                        help="PEM bundle of trusted CA certificates for HTTPS")
     parser.add_argument("--readelf", default="aarch64-linux-gnu-readelf")
     args = parser.parse_args()
 
@@ -129,6 +141,11 @@ def main():
         for font in sorted(Path(directory).rglob("*")):
             if font.suffix.lower() in (".ttf", ".otf"):
                 shutil.copy2(font, out / "usr/share/fonts" / font.name)
+    for font in args.font_file:
+        shutil.copy2(font, out / "usr/share/fonts" / font.name)
+    if args.ca_bundle:
+        (out / "etc/ssl/certs").mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(args.ca_bundle, out / "etc/ssl/certs/ca-certificates.crt")
 
     total = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
     count = sum(1 for p in out.rglob("*") if p.is_file())

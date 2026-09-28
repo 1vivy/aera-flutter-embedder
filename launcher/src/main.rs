@@ -9,9 +9,10 @@
 //! through the runtime's own loader. Descriptors (the control channel and
 //! the pixel surface) and arguments pass through untouched.
 //!
-//! Flutter's engine only reads fonts from `/usr/share/fonts/`. Plugins run
-//! as root, so the launcher gives itself a private mount namespace and binds
-//! the payload's fonts there; recovery's own mounts are not changed.
+//! Flutter's engine only reads fonts from `/usr/share/fonts/` and Dart only
+//! trusts `/etc/ssl/certs/ca-certificates.crt`. Plugins run as root, so the
+//! launcher gives itself a private mount namespace and binds the payload's
+//! fonts and CA bundle there; recovery's own mounts are not changed.
 //!
 //! Build it static so the kernel needs no loader to start it:
 //! `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p aera-plugin --target <triple>`
@@ -41,38 +42,66 @@ fn cstring(value: &OsStr) -> CString {
     CString::new(value.as_bytes()).expect("argument with NUL")
 }
 
-/// Makes `/usr/share/fonts` show the payload's fonts, in a mount namespace
-/// only this plugin (and its children) see. Best effort: text is missing,
-/// not the app, when it fails.
-fn bind_fonts(root: &Path) {
-    let fonts = root.join("usr/share/fonts");
-    let target = Path::new("/usr/share/fonts");
-    if !fonts.is_dir() || root == Path::new("/") || unsafe { libc::geteuid() } != 0 {
-        return;
+/// Gives this plugin (and its children) a private mount namespace, so the
+/// binds below never change recovery's own mounts. Plugins run as root.
+fn private_namespace(root: &Path) -> bool {
+    if root == Path::new("/") || unsafe { libc::geteuid() } != 0 {
+        return false;
     }
-    let path = |p: &Path| cstring(p.as_os_str());
     unsafe {
         if libc::unshare(libc::CLONE_NEWNS) != 0
             || libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) != 0
         {
-            eprintln!("aera-plugin: no private mount namespace for fonts: {}", std::io::Error::last_os_error());
-            return;
+            eprintln!("aera-plugin: no private mount namespace: {}", std::io::Error::last_os_error());
+            return false;
         }
     }
-    // Recovery's rootfs is a ramdisk, so a created mount point is gone at
-    // the next boot.
-    if std::fs::create_dir_all(target).is_err() {
+    true
+}
+
+/// Binds the payload's `source` over `target`, creating the mount point
+/// (a directory or an empty file, like `source`) if it is missing. Recovery's
+/// rootfs is a ramdisk, so a created mount point is gone at the next boot.
+/// Symlinks on the way are followed: recovery's `/etc` points at
+/// `/system/etc`. Best effort.
+fn bind(source: &Path, target: &Path) {
+    let created = if source.is_dir() {
+        std::fs::create_dir_all(target)
+    } else {
+        target
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(target).map(drop))
+    };
+    let resolved = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    if let Err(error) = created {
+        eprintln!("aera-plugin: no mount point at {}: {error}", resolved.display());
         return;
     }
-    let (source, target) = (path(&fonts), path(target));
-    if unsafe { libc::mount(source.as_ptr(), target.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } != 0 {
-        eprintln!("aera-plugin: could not bind fonts: {}", std::io::Error::last_os_error());
+    let (from, to) = (cstring(source.as_os_str()), cstring(resolved.as_os_str()));
+    if unsafe { libc::mount(from.as_ptr(), to.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } != 0 {
+        eprintln!("aera-plugin: could not bind {}: {}", resolved.display(), std::io::Error::last_os_error());
+    }
+}
+
+/// Flutter's engine only reads fonts from `/usr/share/fonts/`, and Dart's
+/// HttpClient only trusts `/etc/ssl/certs/ca-certificates.crt` (it ignores
+/// SSL_CERT_FILE). Recovery has neither, so the payload's copies are bound
+/// there. Without them text or HTTPS is missing, not the app.
+fn bind_runtime_files(root: &Path) {
+    let files = [("usr/share/fonts", "/usr/share/fonts"), ("etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt")];
+    let wanted: Vec<_> = files.iter().map(|(from, to)| (root.join(from), Path::new(to))).filter(|(from, _)| from.exists()).collect();
+    if wanted.is_empty() || !private_namespace(root) {
+        return;
+    }
+    for (source, target) in wanted {
+        bind(&source, target);
     }
 }
 
 fn main() {
     let root = runtime_root();
-    bind_fonts(&root);
+    bind_runtime_files(&root);
     set_default("AERA_PLUGIN_ROOT", &root);
     let icd = root.join("usr/share/vulkan/icd.d/freedreno_icd.json");
     if icd.is_file() {

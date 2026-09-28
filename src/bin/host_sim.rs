@@ -312,8 +312,15 @@ fn main() {
                 std::thread::sleep(options.ack_delay);
                 send(Message { request_id: last, ..Message::new(kind::FRAME_DONE) });
             }
-            kind::KEYBOARD_SHOW => println!("keyboard shown (purpose {})", message.value),
-            kind::KEYBOARD_HIDE => println!("keyboard hidden"),
+            kind::KEYBOARD_SHOW => {
+                println!("keyboard shown (purpose {})", message.value);
+                // AERA's keyboard is about 28% of the screen on the phone.
+                send(Message { value: geometry.height * 28 / 100, ..Message::new(kind::KEYBOARD_INSET) });
+            }
+            kind::KEYBOARD_HIDE => {
+                println!("keyboard hidden");
+                send(Message::new(kind::KEYBOARD_INSET));
+            }
             kind::SET_STATUS => println!("status: {}", message.text),
             kind::CLOSE => {
                 println!("plugin asked to close");
