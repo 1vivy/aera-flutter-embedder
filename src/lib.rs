@@ -11,5 +11,6 @@ pub mod engine;
 mod ffi;
 pub mod gl;
 pub mod host;
+pub mod recovery;
 pub mod text_input;
 pub mod vk;

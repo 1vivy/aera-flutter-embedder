@@ -10,12 +10,13 @@ use std::sync::{Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::host::{self, kind, lifecycle, Control, Geometry, Message, Surface};
 use crate::ffi::*;
 use crate::gl::{Gpu, Region};
 use crate::vk::Vulkan;
+use crate::recovery;
 use crate::text_input::{Effect, TextInput};
 
 pub struct Config {
@@ -139,6 +140,7 @@ pub struct Embedder {
 impl Embedder {
     pub fn start(config: Config, session: host::Session) -> Result<Embedder, String> {
         let host::Session { control, surface, early, .. } = session;
+        recovery::apply_time_zone();
         let geometry = surface.geometry();
         let library = unsafe { libloading::Library::new(&config.engine_library) }
             .map_err(|e| format!("load {}: {e}", config.engine_library.display()))?;
@@ -295,6 +297,7 @@ impl Embedder {
         embedder.send_metrics(geometry);
         embedder.send_locale(&config.locale);
         embedder.send_lifecycle("AppLifecycleState.resumed");
+        embedder.send_settings();
         for message in &early {
             if !embedder.handle(message) {
                 return Err("AERA closed the plugin while it started".into());
@@ -326,6 +329,13 @@ impl Embedder {
         entry.country_code = country.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let mut list = [&entry as *const FlutterLocale];
         unsafe { self.shared.procs.UpdateLocales.unwrap()(self.engine(), list.as_mut_ptr(), 1) };
+    }
+
+    /// AERA's theme, interface size and clock format, which the user may
+    /// have changed while the app was in the background.
+    fn send_settings(&self) {
+        let settings = recovery::settings(&recovery::preferences());
+        self.shared.send_message("flutter/settings", settings.to_string().as_bytes());
     }
 
     fn send_lifecycle(&self, state: &str) {
@@ -455,7 +465,10 @@ impl Embedder {
             }
             kind::BACK => shared.send_message("flutter/navigation", br#"{"method":"popRoute","args":null}"#),
             kind::LIFECYCLE => match message.value {
-                lifecycle::RESUME => self.send_lifecycle("AppLifecycleState.resumed"),
+                lifecycle::RESUME => {
+                    self.send_settings();
+                    self.send_lifecycle("AppLifecycleState.resumed")
+                }
                 lifecycle::PAUSE => self.send_lifecycle("AppLifecycleState.paused"),
                 lifecycle::STOP => return false,
                 _ => {}
@@ -525,8 +538,11 @@ impl Shared {
                     self.wake();
                     Some(b"[null]".to_vec())
                 }
-                "Clipboard.hasStrings" => Some(json!([{"value": false}]).to_string().into_bytes()),
-                _ => None,
+                _ => recovery::platform(method, &call["args"]).map(|reply| reply.to_string().into_bytes()),
+            },
+            recovery::CHANNEL => match recovery::call(method, &call["args"]) {
+                Value::Null => None,
+                reply => Some(reply.to_string().into_bytes()),
             },
             _ => None,
         }
