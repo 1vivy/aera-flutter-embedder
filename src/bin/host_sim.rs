@@ -8,6 +8,7 @@
 //! ```text
 //! aera-host-sim --worker target/release/aera-browser-worker --root payload/ \
 //!     --out frames/ --until 3000 --tap 316,655@1000 --key h@2000 --save-at 2500
+//!     [--drag 100,300>200,400@1500] [--ack-delay 12]
 //! ```
 //!
 //! Times are milliseconds after the first frame; taps use AERA's 360x700 view
@@ -26,6 +27,8 @@ use aera_flutter_embedder::bridge::{self, kind, Control, Frames, Packet};
 
 enum Input {
     Tap(i32, i32),
+    /// Press at the first point, move to the second over ~300 ms, release.
+    Drag(i32, i32, i32, i32),
     Key(u32),
     Back,
 }
@@ -75,6 +78,15 @@ fn parse() -> Result<Options, String> {
                 let (x, y) = point.split_once(',').ok_or("tap needs X,Y in 360x700 view pixels")?;
                 let (x, y) = (x.parse().map_err(|_| "bad x")?, y.parse().map_err(|_| "bad y")?);
                 options.script.push((frame, Input::Tap(x, y)));
+            }
+            "--drag" => {
+                let (path, frame) = at(&value()?)?;
+                let numbers: Vec<i32> = path
+                    .split(|c| c == ',' || c == '>')
+                    .map(|n| n.parse().map_err(|_| "drag needs X1,Y1>X2,Y2"))
+                    .collect::<Result<_, _>>()?;
+                let [x1, y1, x2, y2] = numbers[..] else { return Err("drag needs X1,Y1>X2,Y2".into()) };
+                options.script.push((frame, Input::Drag(x1, y1, x2, y2)));
             }
             "--key" => {
                 let (key, frame) = at(&value()?)?;
@@ -185,6 +197,14 @@ fn main() {
                         send(kind::TOUCH_DOWN, x, y, 0);
                         std::thread::sleep(Duration::from_millis(60));
                         send(kind::TOUCH_UP, x, y, 0);
+                    }
+                    Input::Drag(x1, y1, x2, y2) => {
+                        send(kind::TOUCH_DOWN, x1, y1, 0);
+                        for step in 1..=10 {
+                            std::thread::sleep(Duration::from_millis(30));
+                            send(kind::TOUCH_MOVE, x1 + (x2 - x1) * step / 10, y1 + (y2 - y1) * step / 10, 0);
+                        }
+                        send(kind::TOUCH_UP, x2, y2, 0);
                     }
                     Input::Key(code) => send(kind::KEY, 0, 0, code),
                     Input::Back => send(kind::BACK, 0, 0, 0),
