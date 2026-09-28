@@ -17,8 +17,9 @@
 //!   the Recents swipe-up strip included. `getState` returns a safe area
 //!   (`padding`) and AERA's gesture areas (`gestureInsets`), which
 //!   `AeraScope` puts in `MediaQuery`, as on the browser-slot branch.
-//!   ASSUMED until the host reports them: AERA's status bar height at the
-//!   top and 96 screen px at the bottom, scaled from the 3168 px screen.
+//!   These are fixed, good-enough values for a typical phone, not asked of
+//!   the host: AERA's status bar height at the top and 96 screen px at the
+//!   bottom, scaled from the 3168 px screen.
 //!
 //! Calls from Dart use the standard JSON method codec.
 
@@ -33,11 +34,12 @@ const KEYBOARD_SHARE: f64 = 760.0 / 2708.0;
 
 /// AERA's screen height, which the constants below are measured against.
 const SCREEN_HEIGHT: f64 = 3168.0;
-/// ASSUMED top safe area: AERA's own status bar height (165 px,
+/// Top safe area: AERA's own status bar height (165 px,
 /// `aera_ui_host.cpp`), which clears the camera hole and the top corners.
 const TOP_PADDING: f64 = 165.0;
-/// ASSUMED bottom safe area: the Recents strip, `max(64, 3168 / 44)` = 72 px
-/// (`engine.cpp`, `bottom_edge`), and the rounded corners.
+/// Bottom safe area: the Recents strip, `max(64, 3168 / 44)` = 72 px
+/// (`engine.cpp`, `bottom_edge`), plus room for a typical phone's corner
+/// radius (about 100 to 140 px on a 1440 px wide screen).
 const BOTTOM_PADDING: f64 = 96.0;
 /// AERA's gestures [left, top, right, bottom] in screen px: the back edges
 /// (`max(72, 1440 / 20)`) and the Recents strip.
