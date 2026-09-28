@@ -624,14 +624,20 @@ fn damage_bounds(damage: &FlutterDamage) -> Option<Region> {
 unsafe extern "C" fn present(user_data: *mut c_void, info: *const FlutterPresentInfo) -> bool {
     let s = shared(user_data);
     let damage = if std::env::var_os("AERA_FLUTTER_FULL_FRAMES").is_some() { None } else { damage_bounds(&(*info).frame_damage) };
-    let Some((mut state, ack_wait)) = wait_for_ack(s) else { return false };
-    let next = state.sequence.wrapping_add(1);
-    let region = match (damage, state.last_damage) {
-        (Some(now), Some(before)) => Some(now.union(before)),
-        _ => None,
+    // Start the GPU copy before waiting for AERA, so the two overlap. The
+    // slot itself is only written once AERA has released it.
+    let (next, region) = {
+        let mut state = s.frame_state.lock().unwrap();
+        let region = match (damage, state.last_damage) {
+            (Some(now), Some(before)) => Some(now.union(before)),
+            _ => None,
+        };
+        state.last_damage = damage;
+        (state.sequence.wrapping_add(1), region)
     };
-    state.last_damage = damage;
-    let (readback, convert) = s.gl().read_frame(s.frames.slot(next), region);
+    let readback = s.gl().start_read(region);
+    let Some((state, ack_wait)) = wait_for_ack(s) else { return false };
+    let (readback, convert) = s.gl().finish_read(readback, s.frames.slot(next));
     if let Some(stats) = &s.stats {
         let area = region.map_or(1.0, |r| r.area() as f64 / (bridge::WIDTH as f64 * bridge::HEIGHT as f64));
         stats.lock().unwrap().add(ack_wait, readback, convert, area);

@@ -50,6 +50,9 @@ const GL_PACK_ROW_LENGTH: GLenum = 0x0D02;
 const GL_RENDERER: GLenum = 0x1F01;
 const GL_EXTENSIONS: GLenum = 0x1F03;
 const GL_BGRA_EXT: GLenum = 0x80E1;
+const GL_PIXEL_PACK_BUFFER: GLenum = 0x88EB;
+const GL_STREAM_READ: GLenum = 0x88E1;
+const GL_MAP_READ_BIT: GLenum = 0x0001;
 
 struct Egl {
     get_platform_display: unsafe extern "C" fn(EGLenum, *mut c_void, *const isize) -> EGLDisplay,
@@ -77,6 +80,20 @@ struct Gles {
     finish: unsafe extern "C" fn(),
     get_string: unsafe extern "C" fn(GLenum) -> *const u8,
     get_error: unsafe extern "C" fn() -> GLenum,
+    flush: unsafe extern "C" fn(),
+    gen_buffers: unsafe extern "C" fn(GLsizei, *mut GLuint),
+    bind_buffer: unsafe extern "C" fn(GLenum, GLuint),
+    buffer_data: unsafe extern "C" fn(GLenum, isize, *const c_void, GLenum),
+    map_buffer_range: unsafe extern "C" fn(GLenum, isize, isize, GLenum) -> *mut c_void,
+    unmap_buffer: unsafe extern "C" fn(GLenum) -> u8,
+}
+
+/// A frame copy the GPU has been asked to make into the pack buffer; hand it
+/// to `Gpu::finish_read` to wait for it and copy it out.
+pub struct Readback {
+    region: Region,
+    bgra: bool,
+    issued: std::time::Duration,
 }
 
 /// An EGL display with two contexts: one Flutter renders with on the raster
@@ -129,6 +146,8 @@ pub struct Gpu {
     fbo: std::sync::atomic::AtomicU32,
     /// 0 not yet checked, 1 GL_BGRA_EXT readback works, 2 it does not.
     bgra_readback: std::sync::atomic::AtomicU8,
+    /// Pixel pack buffer frames are read into, created on first use.
+    pack_buffer: std::sync::atomic::AtomicU32,
 }
 
 // EGL handles are process-wide; each context is only made current on the
@@ -204,6 +223,12 @@ impl Gpu {
                 finish: gl!("glFinish"),
                 get_string: gl!("glGetString"),
                 get_error: gl!("glGetError"),
+                flush: gl!("glFlush"),
+                gen_buffers: gl!("glGenBuffers"),
+                bind_buffer: gl!("glBindBuffer"),
+                buffer_data: gl!("glBufferData"),
+                map_buffer_range: gl!("glMapBufferRange"),
+                unmap_buffer: gl!("glUnmapBuffer"),
             };
             Ok(Gpu {
                 _library: library,
@@ -215,6 +240,7 @@ impl Gpu {
                 height,
                 fbo: std::sync::atomic::AtomicU32::new(0),
                 bgra_readback: std::sync::atomic::AtomicU8::new(0),
+                pack_buffer: std::sync::atomic::AtomicU32::new(0),
             })
         }
     }
@@ -269,26 +295,20 @@ impl Gpu {
         }
     }
 
-    /// Copies the finished frame into `out` (a frame slot) as top-down
-    /// ARGB8888, i.e. B, G, R, A bytes in memory, the layout AERA's browser
-    /// bridge expects. Flutter already draws the frame upside down (see
-    /// `engine::flip_vertically`), so GL's bottom-up rows come out top-down.
-    /// Where the driver offers GL_EXT_read_format_bgra the GPU also does the
-    /// swizzle; otherwise R and B are swapped in place.
-    /// Only `region` is read when given; the rest of `out` is left as is.
-    /// Returns how long the GPU readback and the CPU swizzle took.
-    pub fn read_frame(&self, out: &mut [u8], region: Option<Region>) -> (std::time::Duration, std::time::Duration) {
+    /// Asks the GPU to copy the framebuffer (only `region` when given) into
+    /// a pixel pack buffer and returns without waiting for it, so the copy
+    /// runs while the caller waits for AERA. Raster thread only.
+    ///
+    /// The copy is top-down ARGB8888, i.e. B, G, R, A bytes in memory, the
+    /// layout AERA's browser bridge expects. Flutter already draws the frame
+    /// upside down (see `engine::flip_vertically`), so GL's bottom-up rows
+    /// come out top-down. Where the driver offers GL_EXT_read_format_bgra
+    /// the GPU also does the swizzle; otherwise `finish_read` swaps R and B.
+    pub fn start_read(&self, region: Option<Region>) -> Readback {
         use std::sync::atomic::Ordering;
+        let start = std::time::Instant::now();
         let full = Region { x: 0, y: 0, width: self.width, height: self.height };
         let r = region.unwrap_or(full).clamp(self.width, self.height);
-        let row = self.width as usize * 4;
-        assert!(out.len() >= row * self.height as usize);
-        if r.width == 0 || r.height == 0 {
-            return Default::default();
-        }
-        let first = r.y as usize * row + r.x as usize * 4;
-        let target = out[first..].as_mut_ptr().cast();
-        let start = std::time::Instant::now();
         let mut bgra = match self.bgra_readback.load(Ordering::Relaxed) {
             0 => {
                 let supported = self.has_extension("GL_EXT_read_format_bgra");
@@ -297,14 +317,22 @@ impl Gpu {
             }
             state => state == 1,
         };
+        if r.width == 0 || r.height == 0 {
+            return Readback { region: r, bgra, issued: start.elapsed() };
+        }
+        let row = self.width as usize * 4;
+        let first = r.y as usize * row + r.x as usize * 4;
         unsafe {
             let g = &self.gles;
             (g.bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer());
+            (g.bind_buffer)(GL_PIXEL_PACK_BUFFER, self.pack_buffer());
             (g.pixel_storei)(GL_PACK_ALIGNMENT, 4);
             (g.pixel_storei)(GL_PACK_ROW_LENGTH, self.width);
             while (g.get_error)() != 0 {}
+            // With a pack buffer bound, the pointer is an offset into it.
+            let offset = first as *mut c_void;
             if bgra {
-                (g.read_pixels)(r.x, r.y, r.width, r.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, target);
+                (g.read_pixels)(r.x, r.y, r.width, r.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, offset);
                 if (g.get_error)() != 0 {
                     eprintln!("aera-flutter: BGRA readback refused, swizzling on the CPU");
                     self.bgra_readback.store(2, Ordering::Relaxed);
@@ -312,18 +340,70 @@ impl Gpu {
                 }
             }
             if !bgra {
-                (g.read_pixels)(r.x, r.y, r.width, r.height, GL_RGBA, GL_UNSIGNED_BYTE, target);
+                (g.read_pixels)(r.x, r.y, r.width, r.height, GL_RGBA, GL_UNSIGNED_BYTE, offset);
             }
+            (g.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
+            (g.flush)();
+        }
+        Readback { region: r, bgra, issued: start.elapsed() }
+    }
+
+    /// Waits for the copy `start_read` began and writes it into `out`, a
+    /// top-down BGRA frame; pixels outside the region are left as they are.
+    /// Returns the raster thread's time spent reading and swizzling.
+    pub fn finish_read(&self, readback: Readback, out: &mut [u8]) -> (std::time::Duration, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let r = readback.region;
+        let row = self.width as usize * 4;
+        assert!(out.len() >= row * self.height as usize);
+        if r.width == 0 || r.height == 0 {
+            return (readback.issued, Default::default());
+        }
+        let first = r.y as usize * row + r.x as usize * 4;
+        let span = (r.height as usize - 1) * row + r.width as usize * 4;
+        let line = r.width as usize * 4;
+        unsafe {
+            let g = &self.gles;
+            (g.bind_buffer)(GL_PIXEL_PACK_BUFFER, self.pack_buffer());
+            let mapped = (g.map_buffer_range)(GL_PIXEL_PACK_BUFFER, first as isize, span as isize, GL_MAP_READ_BIT);
+            if mapped.is_null() {
+                eprintln!("aera-flutter: could not map the frame readback buffer");
+            } else {
+                let source = std::slice::from_raw_parts(mapped as *const u8, span);
+                for y in 0..r.height as usize {
+                    out[first + y * row..][..line].copy_from_slice(&source[y * row..][..line]);
+                }
+                (g.unmap_buffer)(GL_PIXEL_PACK_BUFFER);
+            }
+            (g.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
         }
         let read = start.elapsed();
-        if !bgra {
+        if !readback.bgra {
             for line in out[first..].chunks_mut(row).take(r.height as usize) {
                 for pixel in line[..r.width as usize * 4].chunks_exact_mut(4) {
                     pixel.swap(0, 2);
                 }
             }
         }
-        (read, start.elapsed() - read)
+        (readback.issued + read, start.elapsed() - read)
+    }
+
+    fn pack_buffer(&self) -> GLuint {
+        use std::sync::atomic::Ordering;
+        let existing = self.pack_buffer.load(Ordering::Acquire);
+        if existing != 0 {
+            return existing;
+        }
+        let mut buffer = 0;
+        unsafe {
+            (self.gles.gen_buffers)(1, &mut buffer);
+            (self.gles.bind_buffer)(GL_PIXEL_PACK_BUFFER, buffer);
+            let size = self.width as isize * self.height as isize * 4;
+            (self.gles.buffer_data)(GL_PIXEL_PACK_BUFFER, size, std::ptr::null(), GL_STREAM_READ);
+            (self.gles.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
+        }
+        self.pack_buffer.store(buffer, Ordering::Release);
+        buffer
     }
 
     fn has_extension(&self, name: &str) -> bool {
