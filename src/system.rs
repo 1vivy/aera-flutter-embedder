@@ -16,6 +16,13 @@
 //!   forwarding touches while the keyboard is up, so the next touch means
 //!   it is gone.
 //!
+//! - AERA's viewport runs to the bottom of the screen, where the display's
+//!   rounded corners and the Recents swipe-up strip sit. The app gets that
+//!   strip as a bottom safe area (`getState` → `padding`) and the back edges
+//!   and the strip as gesture insets; `AeraScope` puts both in `MediaQuery`,
+//!   so `SafeArea`, `Scaffold` and `NavigationBar` keep clear, as on Android.
+//!   The embedder API has no padding field, hence the round trip through Dart.
+//!
 //! Calls from Dart use the standard JSON method codec.
 
 use crate::bridge::{kind, Packet, HEIGHT, VIEW_HEIGHT};
@@ -27,6 +34,21 @@ pub const CHANNEL: &str = "aera/system";
 /// 2708 px high viewport that shows our 2100 px frame
 /// (`web_scene.cpp`: `kBrowserViewportHeight`, `lv_obj_set_size(keyboard)`).
 pub const KEYBOARD_INSET: f64 = (760 * HEIGHT) as f64 / 2708.0;
+
+/// Frame pixels per screen pixel: the 2708 px high viewport shows 2100.
+const SCALE: f64 = HEIGHT as f64 / 2708.0;
+
+/// The bottom safe area, in frame pixels. AERA takes touches in the bottom
+/// `max(64, 3168 / 44)` = 72 screen px for its Recents swipe
+/// (`engine.cpp`, `bottom_edge`), and the display's rounded corners clip
+/// the bottom rows. 96 screen px clears both (about 25 logical px, near
+/// Android's 24 dp gesture bar).
+pub const BOTTOM_PADDING: f64 = 96.0 * SCALE;
+
+/// AERA's own gestures, in frame pixels [left, top, right, bottom]: the back
+/// edges are `max(72, 1440 / 20)` = 72 screen px from each side, and the
+/// viewport starts 24 px in; the bottom is the Recents strip.
+pub const GESTURE_INSETS: [f64; 4] = [48.0 * SCALE, 0.0, 48.0 * SCALE, 72.0 * SCALE];
 
 #[derive(Debug, Default)]
 pub struct System {
@@ -84,7 +106,12 @@ impl System {
                 (json!([null]), vec![self.status()])
             }
             "getState" => (
-                json!([{"keyboardVisible": self.keyboard, "keyboardInset": self.bottom_inset()}]),
+                json!([{
+                    "keyboardVisible": self.keyboard,
+                    "keyboardInset": self.bottom_inset(),
+                    "padding": [0.0, 0.0, 0.0, BOTTOM_PADDING],
+                    "gestureInsets": GESTURE_INSETS,
+                }]),
                 Vec::new(),
             ),
             _ => (Value::Null, Vec::new()),
@@ -145,6 +172,14 @@ mod tests {
         assert_eq!(effects[0], Effect::Metrics);
         assert_eq!(system.bottom_inset(), 0.0);
         assert!(system.from_host(&Packet::new(kind::TOUCH_DOWN)).is_empty());
+    }
+
+    #[test]
+    fn state_carries_the_safe_area() {
+        let (reply, _) = System::default().call("getState", &Value::Null);
+        let bottom = reply[0]["padding"][3].as_f64().unwrap();
+        assert!((bottom - 74.4).abs() < 0.1, "{bottom}");
+        assert!((reply[0]["gestureInsets"][0].as_f64().unwrap() - 37.2).abs() < 0.1);
     }
 
     #[test]
