@@ -13,6 +13,13 @@
 //!   aera-flutter-demo#1). Until the host has sent one, the embedder uses
 //!   the browser keyboard's proportions when it asks for the keyboard.
 //!
+//! - The surface covers the whole screen, rounded corners, camera hole and
+//!   the Recents swipe-up strip included. `getState` returns a safe area
+//!   (`padding`) and AERA's gesture areas (`gestureInsets`), which
+//!   `AeraScope` puts in `MediaQuery`, as on the browser-slot branch.
+//!   ASSUMED until the host reports them: AERA's status bar height at the
+//!   top and 96 screen px at the bottom, scaled from the 3168 px screen.
+//!
 //! Calls from Dart use the standard JSON method codec.
 
 use crate::host::{kind, Message};
@@ -23,6 +30,18 @@ pub const CHANNEL: &str = "aera/system";
 /// AERA's portrait keyboard is 760 px of a 2708 px high screen in the
 /// browser (`web_scene.cpp`); used only until the host reports its own.
 const KEYBOARD_SHARE: f64 = 760.0 / 2708.0;
+
+/// AERA's screen height, which the constants below are measured against.
+const SCREEN_HEIGHT: f64 = 3168.0;
+/// ASSUMED top safe area: AERA's own status bar height (165 px,
+/// `aera_ui_host.cpp`), which clears the camera hole and the top corners.
+const TOP_PADDING: f64 = 165.0;
+/// ASSUMED bottom safe area: the Recents strip, `max(64, 3168 / 44)` = 72 px
+/// (`engine.cpp`, `bottom_edge`), and the rounded corners.
+const BOTTOM_PADDING: f64 = 96.0;
+/// AERA's gestures [left, top, right, bottom] in screen px: the back edges
+/// (`max(72, 1440 / 20)`) and the Recents strip.
+const GESTURE_INSETS: [f64; 4] = [72.0, 0.0, 72.0, 72.0];
 
 #[derive(Debug)]
 pub struct System {
@@ -55,6 +74,11 @@ impl System {
         self.inset
     }
 
+    /// Screen pixels to surface pixels.
+    fn screen(&self, insets: [f64; 4]) -> [f64; 4] {
+        insets.map(|v| v * self.surface_height / SCREEN_HEIGHT)
+    }
+
     /// A method call from Dart. Returns the reply and the effects.
     pub fn call(&mut self, method: &str, args: &Value) -> (Value, Vec<Effect>) {
         match method {
@@ -69,7 +93,12 @@ impl System {
             }
             "setStatus" => (json!([null]), Vec::new()),
             "getState" => (
-                json!([{"keyboardVisible": self.inset > 0.0, "keyboardInset": self.inset}]),
+                json!([{
+                    "keyboardVisible": self.inset > 0.0,
+                    "keyboardInset": self.inset,
+                    "padding": self.screen([0.0, TOP_PADDING, 0.0, BOTTOM_PADDING]),
+                    "gestureInsets": self.screen(GESTURE_INSETS),
+                }]),
                 Vec::new(),
             ),
             _ => (Value::Null, Vec::new()),
@@ -124,6 +153,13 @@ mod tests {
         assert!(system.keyboard_changed(false).is_empty());
         assert_eq!(system.from_host(&Message::new(kind::KEYBOARD_INSET)).len(), 2);
         assert_eq!(system.bottom_inset(), 0.0);
+    }
+
+    #[test]
+    fn state_carries_the_safe_area() {
+        let (reply, _) = System::new(3168).call("getState", &Value::Null);
+        assert_eq!(reply[0]["padding"], json!([0.0, 165.0, 0.0, 96.0]));
+        assert_eq!(reply[0]["gestureInsets"][0], json!(72.0));
     }
 
     #[test]
