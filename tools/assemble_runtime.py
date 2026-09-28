@@ -16,11 +16,12 @@ run time.
         --icu engine/icudtl.dat --mesa mesa/stage \\
         --sysroot /usr/lib/aarch64-linux-gnu --sysroot /lib/aarch64-linux-gnu \\
         --fonts /usr/share/fonts/truetype/roboto/unhinted/RobotoTTF \\
-        --font-file /usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf \\
         --ca-bundle /etc/ssl/certs/ca-certificates.crt
 
 Fonts go to /usr/share/fonts, where the engine looks for them and falls back
-from font to font for characters Roboto lacks (CJK, Devanagari, emoji). The CA
+from font to font. Ship only what an app cannot get from AERA: in the browser
+slot's jail that is a base font (Roboto); the generic host reads AERA's own
+multi-language fonts from /twres/fonts instead. The CA
 bundle goes to /etc/ssl/certs/ca-certificates.crt, the first place Dart looks
 for trusted roots on Linux; without it every HTTPS request fails with
 CERTIFICATE_VERIFY_FAILED.

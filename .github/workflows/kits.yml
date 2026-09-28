@@ -32,8 +32,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build bison flex glslang-tools python3-pip \
             libdrm-dev libexpat1-dev libzstd-dev zlib1g-dev libvulkan-dev libclang-dev \
-            fonts-roboto-unhinted fonts-droid-fallback fonts-noto-core \
-            fonts-noto-color-emoji ca-certificates unzip
+            fonts-roboto-unhinted ca-certificates unzip
           pip3 install --user --break-system-packages 'meson>=1.4' mako pyyaml packaging
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
@@ -52,9 +51,6 @@ jobs:
             --mesa "$RUNNER_TEMP/mesa" --readelf readelf \
             --sysroot /usr/lib/aarch64-linux-gnu --sysroot /lib/aarch64-linux-gnu \
             --fonts /usr/share/fonts/truetype/roboto/unhinted/RobotoTTF \
-            --font-file /usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf \
-            --font-file /usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf \
-            --font-file /usr/share/fonts/truetype/noto/NotoColorEmoji.ttf \
             --ca-bundle /etc/ssl/certs/ca-certificates.crt
           echo "$FLUTTER_VERSION" > runtime/flutter-version
           echo "$ENGINE" > runtime/engine-revision
